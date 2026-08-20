@@ -338,6 +338,22 @@ def _clean_title(text: str) -> Optional[str]:
     return title
 
 
+def _response_format_rejected(exc: Exception) -> bool:
+    """True when the provider rejected the request because of response_format.
+
+    Providers like DeepSeek only support ``json_object`` (not ``json_schema``)
+    and hard-400 the entire request when the caller asks for a schema.  The
+    title prompt already constrains the output to ``{"title": "..."}`` and
+    ``_extract_title_text`` falls back through loose JSON/prose, so dropping
+    the format hint is safe — the request just must not carry the field.
+    """
+    status = getattr(exc, "status_code", None)
+    if status not in (400, 422):
+        return False
+    msg = str(exc).lower()
+    return "response_format" in msg or "response format" in msg
+
+
 def generate_title(
     user_message: str,
     timeout: Optional[float] = None,
@@ -429,6 +445,28 @@ def generate_title(
             return None
         return title
     except Exception as e:
+        # Some providers (DeepSeek, and others that only accept json_object)
+        # hard-400 the json_schema response_format instead of ignoring it.
+        # The prompt alone constrains the output shape, and the loose-JSON
+        # fallback in _extract_title_text handles the response — so retry
+        # once without the rejected hint before giving up.
+        if _response_format_rejected(e):
+            logger.warning(
+                "Title generation: provider rejected response_format (%s); retrying without it", e
+            )
+            try:
+                response = call_llm(
+                    task="title_generation",
+                    messages=messages,
+                    max_tokens=64,
+                    temperature=0.3,
+                    timeout=timeout,
+                    main_runtime=main_runtime,
+                )
+                content = response.choices[0].message.content or ""
+                return _clean_title(_extract_title_text(content))
+            except Exception as retry_exc:
+                e = retry_exc
         # Log at WARNING so this shows up in agent.log without debug mode.
         # Full detail at debug level for operators who need the stack.
         logger.warning("Title generation failed: %s", e)

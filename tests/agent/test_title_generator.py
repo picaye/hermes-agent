@@ -145,6 +145,57 @@ class TestGenerateTitle:
         assert captured[0][0] == "title generation"
         assert captured[0][1] is exc
 
+    def test_retries_without_response_format_on_provider_rejection(self):
+        """Providers that only accept json_object (e.g. DeepSeek) hard-400 the
+        json_schema response_format. The call must be retried without the
+        hint so the loose-JSON/prose fallback can still produce a title."""
+        calls = []
+
+        class _BadRequest400(RuntimeError):
+            status_code = 400
+
+        def _call_llm(**kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                raise _BadRequest400(
+                    "HTTP 400: This response_format type is unavailable now"
+                )
+            resp = MagicMock()
+            resp.choices = [MagicMock()]
+            resp.choices[0].message.content = '{"title": "Retried Title"}'
+            return resp
+
+        with patch("agent.title_generator.call_llm", side_effect=_call_llm):
+            title = generate_title("question")
+
+        assert title == "Retried Title"
+        assert len(calls) == 2
+        # First attempt carries the schema hint; the retry must not.
+        assert "response_format" in (calls[0].get("extra_body") or {})
+        assert "extra_body" not in calls[1] or "response_format" not in (calls[1].get("extra_body") or {})
+
+    def test_no_retry_when_failure_is_not_response_format(self):
+        """A 400 that is unrelated to response_format must not trigger the
+        retry — the failure callback still fires exactly once."""
+        calls = []
+
+        class _BadRequest400(RuntimeError):
+            status_code = 400
+
+        def _call_llm(**kwargs):
+            calls.append(kwargs)
+            raise _BadRequest400("HTTP 400: model_not_found")
+
+        captured = []
+        with patch("agent.title_generator.call_llm", side_effect=_call_llm):
+            result = generate_title(
+                "question", failure_callback=lambda task, exc: captured.append(exc)
+            )
+
+        assert result is None
+        assert len(calls) == 1
+        assert len(captured) == 1
+
 
 
 
