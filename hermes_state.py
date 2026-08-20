@@ -3149,7 +3149,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     _WRITE_RETRY_SLOW_MIN_S = 0.250  # 250ms
     _WRITE_RETRY_SLOW_MAX_S = 1.000  # 1s
     # Attempt a WAL checkpoint every N successful writes (PASSIVE mode).
-    _CHECKPOINT_EVERY_N_WRITES = 50
+    _CHECKPOINT_EVERY_N_WRITES = 1000
     # Retain the existing coarse 1000-write maintenance cadence, but replace
     # the unbounded FTS5 ``'optimize'`` (measured holding the write lock for
     # 9-18 s per index on a 10 GB production DB — longer than a competing
