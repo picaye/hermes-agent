@@ -48,7 +48,7 @@ EXCLUDED_SKILL_DIRS = frozenset(
 # skill_view(skill, file_path=...). They are not standalone skills and must not
 # be scanned for active SKILL.md/DESCRIPTION.md entries, even if a Curator or
 # archive workflow preserves a complete old skill package under references/.
-SKILL_SUPPORT_DIRS = frozenset(("references", "templates", "assets", "scripts"))
+SKILL_SUPPORT_DIRS = frozenset(("references", "templates", "assets", "scripts", "prompts"))
 
 # ── Org-shared skills (sync contract) ───────────────────────────
 # Org mirrors live under ~/.hermes/skills/_org/<org_id>/. Resolution is
