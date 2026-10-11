@@ -403,6 +403,11 @@ def obligation_fields() -> Optional[dict[str, str]]:
     if record is None:
         return None
     fields = {"expected_sha": str(record.get("expected_sha") or "")}
+    started = record.get("started")
+    if started is not None:
+        # Age of the armed obligation: the drain-aware startup exemption bounds the self-restart
+        # window by the force-restart cap instead of warning on every CLI start during it.
+        fields["started"] = str(started)
     inventory = record.get("inventory")
     if inventory is not None:
         fields["inventory"] = json.dumps(inventory)

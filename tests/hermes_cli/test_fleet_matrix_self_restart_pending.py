@@ -62,10 +62,13 @@ def test_ancestor_with_accepted_self_restart_is_pending_while_other_stale_rows_s
     assert {row["state"] for row in plain} == {"stale"}
 
 
-def test_restart_phase_records_accepted_self_restart_and_verify_exits_clean(monkeypatch, tmp_path):
-    """The ancestor branch of the drain triage feeds the pid set the matrix reads: end to end the
-    verify phase exits 0 (not 1) and clears the pending marker for an update whose only old-code
-    gateway is the one it runs inside."""
+def test_restart_phase_records_accepted_self_restart_and_verify_keeps_it_owed(monkeypatch, tmp_path):
+    """The ancestor branch of the drain triage feeds the pid set the matrix reads. End to end the
+    verify phase exits 0 (contract C3) but keeps the restart OWED: a signalled drain is not a
+    completed restart, so the follow-up says "signalled, draining", the pending marker is NOT
+    cleared, and the armed obligation verifies the successor's code identity on every later CLI
+    start (the Oct-11 class: the receipt claimed "restarted", the follow-up claimed "stopped").
+    """
     from hermes_cli import gateway
     from hermes_cli import update_cmd
 
@@ -86,23 +89,104 @@ def test_restart_phase_records_accepted_self_restart_and_verify_exits_clean(monk
     monkeypatch.setattr(fleet_mod, "_clear_fleet_restart_pending_marker", lambda: cleared.append(True))
     monkeypatch.setattr("hermes_cli.gateway_migrate.maybe_auto_migrate_after_update", lambda: None)
     restart = fleet_mod._GatewayRestartOutcome(
-        incomplete=False, phase_errors=[], pre_restart_gateway_pids=[ancestor], restarted_services=["hermes-gateway"],
+        # The restart phase records the label as SIGNALED, never as restarted, and marks the
+        # restart owed until the successor is verified.
+        incomplete=True, phase_errors=[], pre_restart_gateway_pids=[ancestor], restarted_services=[],
         failed_or_stale_units=[], relaunched_profiles=[], externally_supervised_profiles=[], killed_pids=set(),
-        self_restart_pending_pids=pending,
+        self_restart_pending_pids=pending, restart_signalled_services=["hermes-gateway"],
     )
     with contextlib.redirect_stdout(io.StringIO()) as out:
         fleet_verify._verify_fleet_after_update(
             restart, _pre_update_plan=None, _windows_gateway_resume=None, update_complete=True,
         )  # a SystemExit(1) here is the #119597 symptom
-    assert "restart pending" in out.getvalue()
-    assert "Update not complete" not in out.getvalue()
-    assert cleared == [True]
+    text = out.getvalue()
+    assert "restart pending" in text
+    assert "Update not complete" not in text
+    assert "follow-up 'gateway_restart'" in text
+    # Truthful at both ends: never "stopped" for a live draining pid, never "restarted" for a
+    # restart that has not been observed.
+    assert "draining" in text and "stopped PIDs" not in text
+    assert cleared == []  # the obligation stays armed until the successor proves the new code
+    assert restart.incomplete
+
+
+def test_verify_escalates_restart_pending_rows_even_if_the_restart_phase_left_incomplete_false(monkeypatch, tmp_path):
+    """Defense in depth: a fleet matrix row rendered ``restart_pending`` is an UNVERIFIED restart.
+    Even when the restart-phase bookkeeping forgot to mark the outcome incomplete, verification
+    keeps the debt armed instead of clearing the marker on a false-success reading."""
+    from hermes_cli import update_cmd
+
+    ancestor = os.getpid()
+    _fleet_homes(monkeypatch, tmp_path, {"default": {"pid": ancestor, "gateway_state": "running", "code_sha": OLD}})
+    monkeypatch.setattr(fleet_verify, "_print_legacy_units_warning", lambda: None)
+    monkeypatch.setattr("hermes_cli.update_cmd_maint._refresh_dashboard_after_update", lambda *a, **k: None)
+    monkeypatch.setattr(update_cmd, "_surviving_pre_update_serve_runtimes", lambda plan: [])
+    monkeypatch.setattr(fleet_mod._time, "sleep", lambda s: None)
+    cleared = []
+    monkeypatch.setattr(fleet_mod, "_clear_fleet_restart_pending_marker", lambda: cleared.append(True))
+    monkeypatch.setattr("hermes_cli.gateway_migrate.maybe_auto_migrate_after_update", lambda: None)
+    restart = fleet_mod._GatewayRestartOutcome(
+        incomplete=False, phase_errors=[], pre_restart_gateway_pids=[ancestor], restarted_services=[],
+        failed_or_stale_units=[], relaunched_profiles=[], externally_supervised_profiles=[], killed_pids=set(),
+        self_restart_pending_pids={ancestor},
+    )
     with contextlib.redirect_stdout(io.StringIO()) as out:
-        restart.self_restart_pending_pids = set()  # same fleet, identity not threaded → STALE
         fleet_verify._verify_fleet_after_update(
             restart, _pre_update_plan=None, _windows_gateway_resume=None, update_complete=True,
         )
-    # Contract C3: STALE is an owed restart (was SystemExit(1)): flagged, follow-up, marker kept.
     assert restart.incomplete
-    assert "follow-up 'gateway_restart'" in out.getvalue()
-    assert cleared == [True]
+    assert "draining" in out.getvalue() and "stopped PIDs" not in out.getvalue()
+    assert cleared == []
+
+
+def test_supervisor_wrapper_pid_credits_the_gateway_process_under_it(monkeypatch, tmp_path):
+    """launchd/systemd bookkeeping records the supervised wrapper PID while the fleet row carries
+    the gateway process underneath it. The wrapper's drain signal restarts the whole tree, so the
+    child gateway is equally ``restart_pending`` — judging it STALE is what made the updater
+    signal its own live ancestor and then report it as 'stopped' (Oct-11 receipt class)."""
+    me, parent = os.getpid(), os.getppid()
+    _fleet_homes(monkeypatch, tmp_path, {"default": {"pid": me, "gateway_state": "running", "code_sha": OLD}})
+    fleet = ur.collect_fleet_versions(pre_restart_pids=[me], self_restart_pending={parent})
+    assert fleet and fleet[0]["state"] == ur.RESTART_PENDING_STATE
+    # An unrelated ancestor set still leaves the row STALE: the exemption is per-tree, not global.
+    other = ur.collect_fleet_versions(pre_restart_pids=[me], self_restart_pending={parent * 0 + 2 ** 30})
+    assert other and other[0]["state"] == "stale"
+
+
+def test_systemd_ancestor_unit_is_signalled_not_credited(monkeypatch, capsys):
+    """#100179 systemd twin: the unit's MainPID is an ancestor of this updater. The unit stays
+    ``active`` while the gateway drains after this process exits, so the ``is-active`` polls in
+    the graceful path would trivially "confirm" a restart that has not happened. The unit is
+    recorded as signalled — never restarted, never failed — and no start/reset-failed verbs are
+    issued against a unit we deliberately left alone."""
+    import subprocess as sp
+
+    ancestor = 4242
+    monkeypatch.setattr(fleet_mod, "_systemctl", lambda cmd, *, timeout: sp.CompletedProcess(
+        cmd, 0,
+        stdout=(
+            "active\n" if "is-active" in " ".join(cmd)
+            else f"{ancestor}\n" if "MainPID" in " ".join(cmd) else ""
+        ),
+        stderr=""))
+    monkeypatch.setattr(fleet_mod, "_systemd_unit_owned_by_update", lambda *a, **k: True)
+    monkeypatch.setattr(fleet_mod, "_repair_unit_without_fatal_exit_park", lambda *a, **k: None)
+    monkeypatch.setattr(fleet_mod, "_service_unit_supports_graceful_sigusr1_restart", lambda name: True)
+    monkeypatch.setattr(fleet_mod, "_resolve_manage_cmd", lambda *a, **k: None)
+    from hermes_cli import gateway as gw
+    monkeypatch.setattr(gw, "_is_pid_ancestor_of_current_process", lambda pid: pid == ancestor)
+    monkeypatch.setattr(gw, "_request_gateway_self_restart", lambda pid: True)
+
+    restarted: list = []
+    failed: list = []
+    signalled: list = []
+    pending: set = set()
+    fleet_mod._restart_one_systemd_gateway_unit(
+        "hermes-gateway", scope="user", scope_cmd=["systemctl", "--user"], drain_budget=5.0,
+        _manage_cmd_cache={}, restarted_services=restarted, failed_or_stale_units=failed,
+        self_restart_pending=pending, restart_signalled_services=signalled,
+    )
+    assert restarted == [] and failed == []
+    assert signalled == ["hermes-gateway"]
+    assert pending == {ancestor}
+    assert "draining" in capsys.readouterr().out

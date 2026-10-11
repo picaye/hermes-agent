@@ -17,6 +17,7 @@ No live gateway, no network. Git and restart are mocked.
 from __future__ import annotations
 
 import json
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -1160,3 +1161,99 @@ def test_completion_arms_obligation_with_checkout_sha_when_head_capture_empty(mo
         {"expected_sha": "", "receipt": {"update_id": "u1"}, "windows_resume": None})
 
     assert armed == [checkout]
+
+
+# ── #100179: a signalled drain is not a failed restart ──────────────────────────
+#
+# When the updater runs INSIDE the gateway's process tree, the restart phase can only hand the
+# gateway a drain signal: the successor appears after this process exits. Warning on every CLI
+# start during that window (the Oct-11 class: 14:30→14:43 warnings while the drain was working
+# as designed) claims a failure that has not happened. The obligation stays armed and the same
+# startup poll discharges it once the successor serves the checkout; the warning starts only
+# when the drain exceeds its force-restart cap, or when something the drain does not explain
+# is still owed.
+
+def _drain_marker(disk_sha: str, pid: int) -> None:
+    update_cmd._write_fleet_restart_pending_marker(
+        expected_sha=disk_sha,
+        runtimes=[{"kind": "gateway", "profile": "default", "pid": pid, "restart_signalled": True}],
+    )
+
+
+def _draining_fleet(pid: int):
+    return lambda **kwargs: [
+        {"profile": "default", "pid": pid, "code_sha": "7" * 40, "code_version": "0.20.0",
+         "state": "restart_pending"}
+    ]
+
+
+def test_startup_warn_silent_while_signalled_gateway_is_draining(monkeypatch, capsys):
+    disk_sha = "e" * 40
+    _drain_marker(disk_sha, os.getpid())
+    _patch_marker_sha(monkeypatch, disk_sha)
+    monkeypatch.setattr("hermes_cli.update_receipt.collect_fleet_versions", _draining_fleet(os.getpid()))
+
+    update_cmd._warn_pending_fleet_restart_on_startup()
+
+    assert capsys.readouterr().err == ""
+    assert update_cmd_fleet._fleet_restart_obligation_armed()  # armed, just not yet overdue
+
+
+def test_startup_warn_discharged_when_the_drain_produces_a_current_successor(monkeypatch, capsys):
+    """The exemption must not strand the obligation: once the successor serves the checkout, the
+    same startup poll discharges it and the marker clears."""
+    disk_sha = "e" * 40
+    _drain_marker(disk_sha, os.getpid())
+    _patch_marker_sha(monkeypatch, disk_sha)
+    monkeypatch.setattr(
+        "hermes_cli.update_receipt.collect_fleet_versions",
+        lambda **kwargs: [
+            {"profile": "default", "pid": 99999, "code_sha": disk_sha, "code_version": "0.21.0",
+             "state": "current"}
+        ],
+    )
+
+    update_cmd._warn_pending_fleet_restart_on_startup()
+
+    assert capsys.readouterr().err == ""
+    assert not update_cmd_fleet._fleet_restart_obligation_armed()
+
+
+def test_startup_warn_fires_when_the_drain_exceeds_its_cap(monkeypatch, capsys):
+    """Bounded by the drain's force-restart cap: past it the successor never showed up and the
+    debt is real again — the warning must return."""
+    import time as _time_mod
+
+    disk_sha = "e" * 40
+    _drain_marker(disk_sha, os.getpid())
+    _patch_marker_sha(monkeypatch, disk_sha)
+    monkeypatch.setattr(update_cmd_fleet, "_gateway_drain_budget", lambda: 10.0)
+    real_time = _time_mod.time
+    monkeypatch.setattr(update_cmd_fleet._time, "time", lambda: real_time() + 10_000)
+    monkeypatch.setattr("hermes_cli.update_receipt.collect_fleet_versions", _draining_fleet(os.getpid()))
+
+    update_cmd._warn_pending_fleet_restart_on_startup()
+
+    assert "did not restart running gateways" in capsys.readouterr().err
+    assert update_cmd_fleet._fleet_restart_obligation_armed()
+
+
+def test_startup_warn_fires_when_a_row_the_drain_does_not_explain_is_stale(monkeypatch, capsys):
+    """The exemption covers ONLY the named draining gateways: a second stale gateway the drain
+    does not explain keeps the warning live inside the cap."""
+    disk_sha = "e" * 40
+    _drain_marker(disk_sha, os.getpid())
+    _patch_marker_sha(monkeypatch, disk_sha)
+    monkeypatch.setattr(
+        "hermes_cli.update_receipt.collect_fleet_versions",
+        lambda **kwargs: [
+            {"profile": "default", "pid": os.getpid(), "code_sha": "7" * 40, "code_version": "0.20.0",
+             "state": "restart_pending"},
+            {"profile": "coder", "pid": 43, "code_sha": "7" * 40, "code_version": "0.20.0", "state": "stale"},
+        ],
+    )
+
+    update_cmd._warn_pending_fleet_restart_on_startup()
+
+    assert "did not restart running gateways" in capsys.readouterr().err
+    assert update_cmd_fleet._fleet_restart_obligation_armed()

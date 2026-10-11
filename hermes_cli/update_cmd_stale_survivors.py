@@ -29,6 +29,9 @@ def signal_stale_fleet_survivors(fleet: list, restart, drain_budget: float) -> l
     """Drain-first restart every proven-stale gateway; returns the PIDs signalled.
 
     Bookkeeping lands in ``restart.killed_pids`` so the receipt and the survivor sweep see them.
+    A gateway that is an ANCESTOR of this updater (the #100179 self-restart branch) is only
+    signalled — it exits after this process does, so it is draining, never "stopped", and must
+    not land in ``killed_pids``/``stopped_unmapped_pids``.
     Never raises: verification must still finalize the receipt (with an owed restart).
     """
     from hermes_cli.update_cmd_fleet import _drain_or_signal_gateway_for_update
@@ -46,10 +49,18 @@ def signal_stale_fleet_survivors(fleet: list, restart, drain_budget: float) -> l
     print(f"  ⚠ {len(pids)} gateway process(es) still run the pre-update code — requesting a restart")
     signalled: list[int] = []
     manual: list[int] = []
+    pending = getattr(restart, "self_restart_pending_pids", None)
     for pid in pids:
         label = f"{labels.get(pid, 'gateway')} (PID {pid})"
         try:
-            if _drain_or_signal_gateway_for_update(pid, drain_budget, label):
+            if _drain_or_signal_gateway_for_update(
+                    pid, drain_budget, label, self_restart_pending=pending):
+                if pending is not None and pid in pending:
+                    # Ancestor branch: the restart was handed to the gateway this updater runs
+                    # inside; it drains and exits after we do. Reporting it as stopped would be
+                    # a false failure claim (the pid is alive by construction).
+                    print(f"  ↻ {label}: restart signalled, gateway draining — verified after this update exits")
+                    continue
                 signalled.append(pid)
                 restart.killed_pids.add(pid)
                 if pid not in service_pids:

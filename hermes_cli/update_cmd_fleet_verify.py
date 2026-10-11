@@ -129,7 +129,7 @@ def _live_gateway_pids_from_fleet(fleet_rows: list) -> dict:
     return live
 
 
-def _record_owed_gateway_inventory(plan, stopped_unmapped_pids=()) -> None:
+def _record_owed_gateway_inventory(plan, stopped_unmapped_pids=(), fleet_rows=()) -> None:
     """Name the pre-update gateways on the obligation once their restart is owed.
 
     The pull arms the obligation before the restart phase knows what it owes. An inventory-less
@@ -138,6 +138,9 @@ def _record_owed_gateway_inventory(plan, stopped_unmapped_pids=()) -> None:
     failed update under contract C3. A named inventory keeps it until those gateways run HEAD.
     A gateway stopped with no known profile is recorded as an unmapped row for the same reason: it
     has no ``gateway_state.json`` the gateway-less probe could see, so absence would settle it.
+    A gateway whose restart was only SIGNALED (self-restart pending, #100179) is recorded as a
+    ``restart_signalled`` row: it is alive and draining, never "stopped", and the startup
+    exemption uses these rows to stay quiet until the drain's force-restart cap passes.
     A readable inventory (a same-SHA catch-up keeps the standing record) only GROWS: rows this run
     newly owes are appended, so a mapped successor cannot discharge a newly stopped unmapped one.
     """
@@ -161,7 +164,14 @@ def _record_owed_gateway_inventory(plan, stopped_unmapped_pids=()) -> None:
         and isinstance(getattr(runtime, "profile", None), str)
         and runtime.profile.strip() and runtime.profile != "unknown"
     ] + [{"kind": "gateway", "profile": None, "pid": pid, "stopped_unmapped": True}
-         for pid in sorted(stopped_unmapped_pids)]
+         for pid in sorted(stopped_unmapped_pids)] + [
+        # Signalled-but-draining gateways: named, alive, owed verification of the successor.
+        {"kind": "gateway", "profile": row["profile"], "pid": row["pid"], "restart_signalled": True}
+        for row in fleet_rows or ()
+        if isinstance(row, dict) and row.get("state") == "restart_pending"
+        and isinstance(row.get("profile"), str) and row["profile"].strip()
+        and isinstance(row.get("pid"), int)
+    ]
     rows = [row for row in rows if row not in recorded]
     if rows:
         # Not armed any more (a pre-restart probe settled an inventory-less record): re-arm, the
@@ -254,7 +264,7 @@ def _verify_fleet_after_update(restart, *, _pre_update_plan, _windows_gateway_re
             # collect_fleet_versions() swallows every failure, so zero rows with
             # expected runtimes is indistinguishable from health — keep the restart owed.
             print(
-                # Fleet probe returned zero rows even though at least one gateway runtime was (or may have
+                # Fleet version check returned no rows even though at least one gateway runtime was (or may have
                 # been) live pre-update — POSIX restart bookkeeping, the pre-restart PID snapshot, the
                 # pre-update plan inventory, or the Windows pause/resume token all count as that signal.
                 # Every failure path inside collect_fleet_versions() is swallowed via logger.debug(), so an
@@ -263,6 +273,15 @@ def _verify_fleet_after_update(restart, *, _pre_update_plan, _windows_gateway_re
                 "\n⚠ Fleet version check returned no rows even though"
                 " gateway runtimes were expected — verification incomplete."
             )
+            restart.incomplete = True
+        elif not restart.incomplete and any(
+                isinstance(row, dict) and row.get("state") == "restart_pending" for row in _fleet_snapshot
+        ):
+            # A ``restart_pending`` row is an UNVERIFIED restart, not a settled one: the successor
+            # can only appear after this process exits (#100179). Keep the debt armed — the follow-up
+            # says "signalled, draining" and the obligation's startup poll verifies the successor's
+            # code identity against the checkout on every later CLI start. Clearing the marker here
+            # is what let the receipt claim a restart nobody had observed.
             restart.incomplete = True
 
     # Every runtime the PLAN saw must appear in restart bookkeeping; an
@@ -283,6 +302,7 @@ def _verify_fleet_after_update(restart, *, _pre_update_plan, _windows_gateway_re
             _runtime_outcomes = match_runtime_outcomes(
                 _pre_update_plan,
                 restarted_services=restart.restarted_services,
+                signalled_services=getattr(restart, "restart_signalled_services", None),
                 relaunched_profiles=restart.relaunched_profiles,
                 externally_supervised_profiles=restart.externally_supervised_profiles,
                 killed_pids=restart.killed_pids,
@@ -329,15 +349,33 @@ def _verify_fleet_after_update(restart, *, _pre_update_plan, _windows_gateway_re
         # follow-up, never a failed update. The fleet obligation stays armed, every CLI start
         # warns about it, and the next `hermes update` retries the restart.
         from hermes_cli.update_receipt import record_followup
-        stopped = sorted(getattr(restart, "stopped_unmapped_pids", None) or ())
-        record_followup(
-            "gateway_restart",
-            "gateways may still run pre-update code or were stopped without a successor"
-            + (f" (stopped PIDs {', '.join(map(str, stopped))})" if stopped else "")
-            + "; recover with `hermes gateway restart`",
+        stopped_all = sorted(getattr(restart, "stopped_unmapped_pids", None) or ())
+        # Only name PIDs as stopped when they are actually dead: a gateway the restart phase
+        # signalled but which is still draining is alive by construction, and calling it
+        # "stopped" is a false failure claim (the Oct-11 receipt class).
+        dead = [pid for pid in stopped_all if not fleet._pid_is_live(pid)]
+        draining_pids = sorted(
+            {int(p) for p in (getattr(restart, "self_restart_pending_pids", None) or ()) if isinstance(p, int)}
+            | {pid for pid in stopped_all if fleet._pid_is_live(pid)}
         )
+        reason = "gateways may still run pre-update code"
+        if dead:
+            reason += f" (stopped PIDs {', '.join(map(str, dead))})"
+        retry = "the next launch or `hermes update` retries it"
+        if draining_pids:
+            reason += (
+                f"; restart signalled, gateway draining (PIDs {', '.join(map(str, draining_pids))})"
+                " — the successor is verified against the checkout on every later CLI start"
+            )
+            retry = (
+                "the gateway exits on its own once in-flight work drains (capped by"
+                " agent.restart_after_turn_timeout); `hermes gateway status` shows the successor"
+            )
+        elif not dead:
+            reason += "; recover with `hermes gateway restart`"
+        record_followup("gateway_restart", reason, retry=retry)
         with _best_effort('Fleet restart inventory not recorded: %s'):
-            _record_owed_gateway_inventory(_pre_update_plan, stopped)
+            _record_owed_gateway_inventory(_pre_update_plan, dead, _fleet_snapshot)
     with _best_effort('Update receipt finalize failed: %s'):
         from hermes_cli.update_receipt import finalize_update_receipt
         # A False ``update_complete`` (unsafe SQLite runtime, owed tail work) never fails the

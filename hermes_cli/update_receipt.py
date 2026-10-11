@@ -181,6 +181,7 @@ class UpdateReceipt:
         self, *, restarted_services: list | None = None, relaunched_profiles: list | None = None,
         externally_supervised_profiles: list | None = None, killed_pids: list | None = None,
         failed_units: list | None = None, incomplete: bool = False, phase_error: str = "",
+        restart_signalled_services: list | None = None,
         fresh_recovery: dict[str, Any] | None = None,
     ) -> None:
         result: dict[str, Any] = {
@@ -189,6 +190,10 @@ class UpdateReceipt:
             "externally_supervised_profiles": list(externally_supervised_profiles or []),
             "killed_pids": [int(p) for p in (killed_pids or [])],
             "failed_units": [str(u) for u in (failed_units or [])],
+            # Units whose restart phase only accepted a drain signal (the gateway is an ancestor
+            # of the updater, #100179): NOT a claim of a completed restart — the successor is
+            # verified by the fleet obligation after this process exits.
+            "restart_signalled_services": [str(s) for s in (restart_signalled_services or [])],
             "incomplete": bool(incomplete),
             "phase_error": phase_error,
         }
@@ -1114,6 +1119,33 @@ def row_is_external(row: Any) -> bool:
     return isinstance(row, dict) and row.get("state") == EXTERNAL_STATE
 
 
+def _pid_is_descendant_of_any(pid: int, ancestors: set[int]) -> bool:
+    """True when any pid in *ancestors* is ``pid`` itself or one of its ancestors.
+
+    A launchd/systemd unit reports the supervised wrapper's PID in the restart bookkeeping while
+    the fleet row carries the gateway process underneath it: the wrapper's drain signal restarts
+    the whole tree, so the child gateway is equally ``restart_pending`` and must not be judged
+    STALE (the misclassification that made the updater SIGTERM its own live ancestor).
+    """
+    if pid <= 0 or not ancestors:
+        return False
+    try:
+        from hermes_cli.gateway import _get_parent_pid
+    except Exception:
+        return False
+    seen: set[int] = set()
+    cur = pid
+    while cur and cur not in seen:
+        if cur in ancestors:
+            return True
+        seen.add(cur)
+        try:
+            cur = _get_parent_pid(cur) or 0
+        except Exception:
+            return False
+    return False
+
+
 def _fleet_row(
     profile: str, pid: int, code_sha: Any, code_version: Any, expected_sha: Any,
     state: str = "unknown", code_root: Optional[Path] = None,
@@ -1124,7 +1156,8 @@ def _fleet_row(
         state = EXTERNAL_STATE
     if state == "unknown" and code_sha and expected_sha:
         state = "current" if str(code_sha) == str(expected_sha) else "stale"
-    if state == "stale" and self_restart_pending and pid in self_restart_pending:
+    if state == "stale" and self_restart_pending and (
+            pid in self_restart_pending or _pid_is_descendant_of_any(pid, self_restart_pending)):
         state = RESTART_PENDING_STATE
     row = {
         "profile": profile, "pid": pid, "code_sha": str(code_sha) if code_sha else None,

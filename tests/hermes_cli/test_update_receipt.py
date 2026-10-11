@@ -66,6 +66,25 @@ class TestReceiptLifecycle:
         assert gr["incomplete"] is False
         assert payload["fleet"][0]["profile"] == "default"
 
+    def test_signalled_drain_is_recorded_as_signalled_not_restarted(self, receipt_home):
+        """#100179: a gateway that is an ANCESTOR of the updater only accepted a drain signal —
+        the successor cannot be observed while this process runs. The receipt must not list its
+        unit in ``restarted_services`` (the Oct-11 false claim); the signalled name lands in its
+        own key so the receipt can still explain what happened."""
+        ur.begin_update_receipt()
+        ur.record_gateway_restart(
+            restarted_services=[],
+            restart_signalled_services=["ai.hermes.gateway"],
+            incomplete=True,
+        )
+        path = _finalize("success", fleet=[{"profile": "default", "state": "restart_pending", "pid": 31339}])
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        gr = payload["gateway_restart"]
+        assert gr["restarted_services"] == []
+        assert gr["restart_signalled_services"] == ["ai.hermes.gateway"]
+        assert gr["incomplete"] is True
+        assert payload["fleet"][0]["state"] == "restart_pending"
+
     def test_fresh_recovery_result_reaches_persisted_receipt(self, receipt_home):
         recovery = {
             "requested": ["coder", "default", "ops"],

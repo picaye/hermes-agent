@@ -336,3 +336,38 @@ class TestInvokingProfileIsVerifiedLikeItsSiblings:
         assert _run_fleet_restart() == ([LABEL], [])
         assert calls["restart"] == 1
         assert calls["verify"] == 1
+
+
+class TestSelfRestartAncestorIsSignalledNotCredited:
+    """#100179: when the supervised PID is an ANCESTOR of this updater (the update runs inside the
+    gateway's own process tree), ``launchd_restart()`` hands the restart to that gateway — it exits
+    only after this process does, so no fresh supervised PID can appear while we wait. Crediting
+    the label as restarted (the Oct-11 receipt class) claims a restart nobody observed; polling
+    would burn the drain budget against a pid that cannot change. The label is recorded as
+    SIGNALED and the PID as pending; the armed fleet obligation verifies the successor on the
+    next CLI start."""
+
+    def test_ancestor_branch_records_signalled_pending_and_credits_nothing(self, monkeypatch, capsys):
+        import os
+
+        ancestor = os.getpid()
+        calls = _patch_launchd_env(monkeypatch, supervised=True)
+        monkeypatch.setattr(gateway_cli, "_launchctl_supervised_pid", lambda label: ancestor)
+        monkeypatch.setattr(gateway_cli, "_is_pid_ancestor_of_current_process", lambda pid: pid == ancestor)
+
+        restarted: list = []
+        failed_or_stale: list = []
+        signalled: list = []
+        pending: set = set()
+        update_cmd._restart_macos_launchd_gateways(
+            restarted, failed_or_stale, 5.0,
+            self_restart_pending=pending, restart_signalled_services=signalled,
+        )
+
+        assert calls["restart"] == 1          # the drain signal WAS handed to the gateway
+        assert calls["verify"] == 0           # no polling against a pid that cannot change
+        assert restarted == []                # never credited as a completed restart
+        assert failed_or_stale == []          # and never as a failure
+        assert signalled == [LABEL]
+        assert pending == {ancestor}
+        assert "draining" in capsys.readouterr().out

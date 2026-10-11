@@ -390,12 +390,15 @@ def match_runtime_outcomes(
     stale_serve_pids: set | None = None, failed_respawn_pids: set | None = None,
     external_gateway_pids: set | None = None,
     live_gateway_pids: dict[str, set[int]] | None = None,
+    signalled_services: list | None = None,
 ) -> list[dict[str, Any]]:
     """Reconcile the plan's runtimes against what the restart phase DID.
 
     The platform restart branches each re-discover their own targets, so a runtime the plan saw can
     be missed with no signal. Returns one ``{kind, profile, pid, mechanism, outcome}`` row per
-    planned runtime; outcome is ``restarted``, ``stopped``, ``failed``, ``deferred``, ``external``
+    planned runtime; outcome is ``restarted``, ``stopped``, ``failed``, ``deferred``, ``external``,
+    ``signalled`` (a drain signal was accepted but no successor is observable yet — the #100179
+    self-restart path; surfaced, not escalated: the armed fleet obligation verifies the successor)
     or ``unaccounted`` (no bookkeeping mentions it — the blind-spot tripwire). Never raises.
     Serve/dashboard runtimes are reconciled in their OWN vocabulary and never borrow the gateway's
     outcome: with ``stale_serve_pids`` a pre-update serve whose incarnation is gone counts as
@@ -445,6 +448,7 @@ def match_runtime_outcomes(
     try:
         failed_set = {str(u) for u in (failed_units or [])}
         restarted_set = {str(s) for s in (restarted_services or [])}
+        signalled_set = {str(s) for s in (signalled_services or [])}
         relaunched = set(relaunched_profiles or []) | set(externally_supervised_profiles or [])
         killed = {int(p) for p in (killed_pids or set())}
         stale_serves = {int(p) for p in stale_serve_pids} if stale_serve_pids is not None else None
@@ -461,7 +465,8 @@ def match_runtime_outcomes(
                 return True
             if r.profile in relaunched:
                 return True
-            return _gateway_named_in(r, failed_set) or _gateway_named_in(r, restarted_set)
+            return (_gateway_named_in(r, failed_set) or _gateway_named_in(r, restarted_set)
+                    or _gateway_named_in(r, signalled_set))
 
         # Baseline identity: the fleet probe publishes at most one row per profile, so successor
         # evidence is only attributable when ONE planned gateway for that profile still needs a
@@ -502,6 +507,10 @@ def match_runtime_outcomes(
                 return "failed"
             if _gateway_named_in(r, restarted_set):
                 return "restarted"
+            if _gateway_named_in(r, signalled_set):
+                # Drain signal accepted, successor only observable after this process exits:
+                # owed verification, not a silent miss and not a completed restart.
+                return "signalled"
             if successors is not None and r.pid is not None:
                 # Incarnation-verified last resort: the planned process is gone and a gateway answers
                 # for the same profile now. Name-independent on purpose — the supervising service's
@@ -568,6 +577,16 @@ def report_unaccounted_runtimes(outcomes: list[dict[str, Any]]) -> bool:
         print("  ℹ Left to their own install (separate checkout, not restarted by this update):")
         for o in external:
             print(f"    • {o['kind']} [{o['profile']}] pid {o['pid']}")
+    signalled = [o for o in outcomes if o.get("outcome") == "signalled"]
+    if signalled:
+        # Surfaced but not escalated by this report: the restart phase signalled these gateways
+        # (drain-first, #100179) and the successor is verified by the armed fleet obligation on
+        # the next CLI start. Saying "never touched" about a gateway we just signalled would be
+        # a false claim; staying silent about an unverified restart would be the other one.
+        print()
+        print("  ↻ Restart signalled, gateway draining (verified after this update exits):")
+        for o in signalled:
+            print(f"    • {o['kind']} [{o['profile']}] pid {o['pid']} — planned mechanism: {o['mechanism']}")
     missed = [o for o in outcomes if o.get("outcome") == "unaccounted"]
     if not missed:
         return False

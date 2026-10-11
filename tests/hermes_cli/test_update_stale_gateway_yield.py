@@ -129,3 +129,30 @@ def test_verify_fleet_hands_stale_rows_to_survivor_signalling(monkeypatch):
     # Contract C3: was SystemExit(1); now flagged incomplete (owed restart, marker kept).
     assert restart.incomplete
     assert seen["fleet"] == stale_fleet
+
+
+def test_survivor_that_is_our_ancestor_is_signalled_draining_not_stopped(monkeypatch):
+    """#100179: a stale gateway that is an ANCESTOR of the updater accepts the self-restart signal
+    and exits only after this process does — it is draining, never "stopped". The old path added
+    its PID to killed_pids/stopped_unmapped_pids, so the receipt claimed a live process was
+    stopped and the startup poll warned about it while the drain was working as designed."""
+    from hermes_cli import gateway as gw
+    from hermes_cli.update_cmd_fleet import _GatewayRestartOutcome
+
+    ancestor = 4242
+    monkeypatch.setattr(gw, "_is_pid_ancestor_of_current_process", lambda pid: pid == ancestor)
+    self_restarts = []
+    monkeypatch.setattr(gw, "_request_gateway_self_restart", lambda pid: self_restarts.append(pid) or True)
+    restart = _GatewayRestartOutcome(
+        incomplete=True, phase_errors=[], pre_restart_gateway_pids=[ancestor], restarted_services=[],
+        failed_or_stale_units=[], relaunched_profiles=[], externally_supervised_profiles=[], killed_pids=set())
+    fleet = [{"profile": "default", "pid": ancestor, "state": "stale", "code_sha": "a" * 40}]
+    from hermes_cli.update_cmd_stale_survivors import signal_stale_fleet_survivors
+    with contextlib.redirect_stdout(io.StringIO()) as out:
+        signalled = signal_stale_fleet_survivors(fleet, restart, 10.0)
+    assert self_restarts == [ancestor]
+    assert signalled == []                                  # not reported as stopped
+    assert restart.killed_pids == set()                     # no false kill claim
+    assert restart.stopped_unmapped_pids == set()
+    assert restart.self_restart_pending_pids == {ancestor}  # recorded as draining for the matrix
+    assert "draining" in out.getvalue()

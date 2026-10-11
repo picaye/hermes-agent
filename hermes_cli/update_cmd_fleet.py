@@ -468,6 +468,55 @@ def _pending_fleet_restart_needed(*, receipt: dict | None = None, pending_manual
     return not _live_fleet_covers_receipt(_current_checkout_sha(), receipt, owed)
 
 
+def _fleet_restart_drain_in_progress() -> bool:
+    """True while an armed obligation's only unmet debt is a gateway draining after a restart
+    SIGNAL (the #100179 self-restart path), inside the drain's force-restart cap.
+
+    The signalled gateway exits only after the updater process does, then reboots on the new code
+    — bounded by ``agent.restart_after_turn_timeout``. Warning on every CLI start during that
+    window claims a failure that has not happened (the Oct-11 class: 14:30→14:43 warnings while
+    the drain was working as designed). The obligation stays ARMED and the same startup poll
+    discharges it once the successor serves the checkout; the warning starts only when the drain
+    exceeds its cap without producing a current gateway, or when something OTHER than the named
+    draining gateways is still owed.
+    """
+    fields = _obligation_fields()
+    if fields is None:
+        return False
+    try:
+        inventory = json.loads(fields.get("inventory", "null"))
+        rows = inventory.get("runtimes") or []
+        draining = {
+            int(row["pid"]) for row in rows
+            if isinstance(row, dict) and row.get("restart_signalled") and isinstance(row.get("pid"), int)
+        }
+    except (ValueError, AttributeError, TypeError):
+        return False
+    if not draining:
+        return False
+    try:
+        started = float(fields.get("started") or 0.0)
+    except (TypeError, ValueError):
+        started = 0.0
+    # Bounded by the drain's force-restart cap plus a boot grace; past it the successor never
+    # showed up and the debt is real again.
+    if not started or _time.time() - started > _gateway_drain_budget() + 120.0:
+        return False
+    if not any(_pid_is_live(pid) for pid in draining):
+        return False  # the drain finished: normal rules judge the successor
+    from hermes_cli.update_receipt import RESTART_PENDING_STATE, collect_fleet_versions, row_is_external
+    try:
+        fleet = collect_fleet_versions(self_restart_pending=draining)
+    except Exception as exc:
+        logger.debug("Fleet probe failed during drain exemption: %s", exc)
+        return False
+    for row in fleet:
+        if row_is_external(row) or row.get("state") in ("current", RESTART_PENDING_STATE):
+            continue
+        return False  # a stale/down/unknown row the drain does not explain: keep warning
+    return True
+
+
 def _update_owes_fleet_restart(*, receipt: dict | None = None, pending_manual: list[dict] | None = None) -> bool:
     """Hold a completed restart to the code it pulled, not a later checkout HEAD."""
     from hermes_cli.update_cmd import _current_checkout_sha
@@ -480,7 +529,10 @@ def _update_owes_fleet_restart(*, receipt: dict | None = None, pending_manual: l
         pending_manual = retain_receipt_manual_serves(receipt)
     # A completed older receipt cannot discharge an independent host obligation's inventory.
     if _fleet_restart_obligation_armed():
-        return not _marker_only_restart_obsolete()
+        if _marker_only_restart_obsolete():
+            return False
+        # A signalled drain is verified by this same poll; stay quiet until its cap passes.
+        return not _fleet_restart_drain_in_progress()
     owed = _receipt_owed_gateways(receipt, pending_manual)
     if not _receipt_reports_stale_runtime(receipt):
         return False
@@ -818,6 +870,7 @@ def _warn_incomplete_gateway_fleet_restart(failed_units: list) -> None:
 
 def _restart_launchd_gateway_after_update(
     *, supervision_verify: bool = True, self_restart_pending: set | None = None,
+    restart_signalled_services: list | None = None,
 ) -> tuple[list, list]:
     """Restart the invoking profile's launchd gateway after an update.
 
@@ -875,9 +928,18 @@ def _restart_launchd_gateway_after_update(
         # launchd_restart() handed the restart to the gateway this updater runs INSIDE (cron job in
         # the gateway tree, #100179): it exits only after this process does, so no fresh supervised
         # pid can appear while we wait. Record it as pending for the fleet matrix (#119597).
+        # Do NOT credit the label as restarted: only a drain signal was accepted. The successor
+        # is verified after this process exits, by the armed fleet obligation on the next CLI
+        # start — the receipt says "signalled, draining" instead of claiming a completed restart.
         if self_restart_pending is not None:
             self_restart_pending.add(old_pid)
-        return [current_label], []
+        if restart_signalled_services is not None:
+            restart_signalled_services.append(current_label)
+        print(
+            f"  ↻ {current_label}: restart signalled, gateway draining — the successor is"
+            " verified once this update exits"
+        )
+        return [], []
 
     # launchd_restart() returning only means "restart REQUESTED" (async). A helper dying
     # before first bootstrap, or a bootstrap exiting 0 without registering (macOS 26.6.1),
@@ -896,7 +958,7 @@ def _restart_launchd_gateway_after_update(
 
 def _restart_macos_launchd_gateways(
     restarted_services: list, failed_or_stale_units: list, drain_budget: float, *, require_supervision: bool = False,
-    self_restart_pending: set | None = None,
+    self_restart_pending: set | None = None, restart_signalled_services: list | None = None,
 ) -> None:
     """Restart every launchd-managed gateway after an update (macOS).
 
@@ -925,7 +987,8 @@ def _restart_macos_launchd_gateways(
     current_label = get_launchd_label()
     resumed = already_restarted()["labels"]  # paused for the update, restarted on the new code
     _restarted, _failed = ([], []) if current_label in resumed else _restart_launchd_gateway_after_update(
-        supervision_verify=True, self_restart_pending=self_restart_pending)
+        supervision_verify=True, self_restart_pending=self_restart_pending,
+        restart_signalled_services=restart_signalled_services)
     restarted_services.extend(_restarted)
     failed_or_stale_units.extend(_failed)
 
@@ -1139,6 +1202,22 @@ def _drain_or_signal_gateway_for_update(
         on_progress=drain_progress_reporter(_gateway_home_for_pid(pid), budget_s=drain_budget))
 
 
+def _pid_is_live(pid: int) -> bool:
+    """True when ``pid`` currently exists. Used to keep restart reporting truthful: a PID the
+    restart phase signalled but which is still draining must never be reported as stopped."""
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists, owned by someone else
+    except OSError:
+        return False
+    return True
+
+
 def _gateway_home_for_pid(pid: int):
     """HERMES_HOME of the gateway ``pid`` per the fleet inventory, else None (own profile's file)."""
     with suppress(Exception):
@@ -1227,6 +1306,7 @@ def _repair_unit_without_fatal_exit_park(svc_name: str, scope: str) -> None:
 def _restart_one_systemd_gateway_unit(
     svc_name: str, *, scope: str, scope_cmd: list, drain_budget: float, _manage_cmd_cache: dict,
     restarted_services: list, failed_or_stale_units: list, self_restart_pending: set | None = None,
+    restart_signalled_services: list | None = None,
 ) -> None:
     """Restart one active systemd gateway/serve unit: graceful SIGUSR1 drain, then forced restart.
 
@@ -1256,6 +1336,19 @@ def _restart_one_systemd_gateway_unit(
     # Three-way triage (ancestor / wedged / graceful drain).
     _graceful_ok = _main_pid > 0 and _drain_or_signal_gateway_for_update(
         _main_pid, drain_budget, svc_name, self_restart_pending=self_restart_pending)
+
+    if _graceful_ok and _main_pid in (self_restart_pending or ()):
+        # Ancestor branch (#100179): the unit's gateway restarts only after THIS process exits,
+        # so the unit stays ``active`` the whole time — the ``is-active`` polls below would
+        # trivially "confirm" a restart that has not happened. Count the unit as signalled,
+        # not restarted; the armed fleet obligation verifies the successor on the next CLI start.
+        if restart_signalled_services is not None:
+            restart_signalled_services.append(svc_name)
+        print(
+            f"  ↻ {svc_name}: restart signalled, gateway draining — the successor is"
+            " verified once this update exits"
+        )
+        return
 
     if _graceful_ok:
         from hermes_cli.update_cmd_fleet_unit_budget import service_restart_sec, systemd_restart_timeout
@@ -1334,6 +1427,7 @@ def _restart_one_systemd_gateway_unit(
 
 def _restart_systemd_gateway_units(
     restarted_services, failed_or_stale_units, restarted_scoped_units, drain_budget, self_restart_pending=None,
+    restart_signalled_services=None,
 ):
     """Restart every active hermes-gateway*/hermes-serve* systemd unit (user + system).
 
@@ -1410,6 +1504,7 @@ def _restart_systemd_gateway_units(
                 restarted_services=restarted_services,
                 failed_or_stale_units=failed_or_stale_units,
                 self_restart_pending=self_restart_pending,
+                restart_signalled_services=restart_signalled_services,
             )
         except subprocess.TimeoutExpired as exc:
             _on_unit_timeout(svc_name, exc)
@@ -1459,6 +1554,10 @@ class _GatewayRestartOutcome:
     #: (``_drain_or_signal_gateway_for_update`` branch 1): they restart only after this process
     #: exits, so the fleet matrix renders them as pending instead of STALE (#119597).
     self_restart_pending_pids: set = field(default_factory=set)
+    #: Unit/label names whose restart phase only SENT a drain signal (the gateway is an ancestor
+    #: of this updater, #100179): no successor has been observed, so the receipt must not count
+    #: them in ``restarted_services`` — a signalled drain is not a completed restart.
+    restart_signalled_services: list = field(default_factory=list)
 
     def fleet_probe_signals(self) -> tuple:
         """``(pre_restart_pids, killed_pids)`` with the unmapped stops removed — the signals that
@@ -1476,6 +1575,7 @@ class _GatewayRestartOutcome:
                 restarted_services=self.restarted_services, relaunched_profiles=self.relaunched_profiles,
                 externally_supervised_profiles=self.externally_supervised_profiles,
                 killed_pids=sorted(self.killed_pids), failed_units=self.failed_or_stale_units,
+                restart_signalled_services=self.restart_signalled_services,
                 incomplete=self.incomplete, **extra,
             )
 
@@ -1528,6 +1628,17 @@ def _restart_manual_gateways(out: _GatewayRestartOutcome, _drain_budget) -> None
                 pid, _drain_budget, proc.profile, self_restart_pending=out.self_restart_pending_pids):
             with suppress(ProcessLookupError, PermissionError):
                 os.kill(pid, _signal.SIGTERM)
+        if pid in out.self_restart_pending_pids:
+            # Ancestor branch (#100179): this manual gateway is above us in the process tree —
+            # it exits only after this updater does, so waiting for its exit here is circular and
+            # crediting killed/relaunched would claim a stop that has not happened. The armed
+            # watcher relaunches it after it exits; the fleet obligation verifies the successor.
+            out.restart_signalled_services.append(f"gateway-{proc.profile}")
+            print(
+                f"  ↻ {proc.profile}: restart signalled, gateway draining — the successor is"
+                " verified once this update exits"
+            )
+            continue
         # Wait ≤5s for exit: Telegram keeps the old getUpdates session ~30s; a new gateway
         # inside that window gets a 409 (_handle_polling_conflict retries, but a brief
         # wait avoids it on fast machines).
@@ -1540,6 +1651,11 @@ def _restart_manual_gateways(out: _GatewayRestartOutcome, _drain_budget) -> None
 
     for pid in manual_pids:
         if pid in profile_processes and pid not in unrestartable_pids:
+            continue
+        if pid in out.self_restart_pending_pids:
+            # Already handed a self-restart signal by the unit pass (the gateway is an ancestor of
+            # this updater, or its supervisor wrapper was): a SIGTERM here would cut the drain short
+            # and bookkeeping would claim we stopped a live, draining gateway.
             continue
         with suppress(ProcessLookupError, PermissionError):
             os.kill(pid, _signal.SIGTERM)
@@ -1724,7 +1840,7 @@ def _restart_gateway_fleet_after_update(_pre_update_plan, gateway_mode: bool):
 
         _restart_systemd_gateway_units(
             out.restarted_services, out.failed_or_stale_units, restarted_scoped_units, _drain_budget,
-            out.self_restart_pending_pids,
+            out.self_restart_pending_pids, out.restart_signalled_services,
         )
 
         # macOS: EVERY ai.hermes.gateway* LaunchAgent (systemd parity).
@@ -1733,9 +1849,17 @@ def _restart_gateway_fleet_after_update(_pre_update_plan, gateway_mode: bool):
                 _restart_macos_launchd_gateways(
                     out.restarted_services, out.failed_or_stale_units, _drain_budget,
                     self_restart_pending=out.self_restart_pending_pids,
+                    restart_signalled_services=out.restart_signalled_services,
                 )
 
         _restart_manual_gateways(out, _drain_budget)
+
+        if out.self_restart_pending_pids or out.restart_signalled_services:
+            # A signalled drain is NOT a completed restart: the successor can only appear after
+            # this process exits, so the restart phase cannot have verified it. Keep the restart
+            # owed — the verification pass arms the fleet obligation, which polls the successor's
+            # code identity on every later CLI start until it matches the checkout.
+            out.incomplete = True
 
         if out.failed_or_stale_units:
             # Owed restart (C3): verification records the follow-up; the /update marker stays committed.
