@@ -206,6 +206,10 @@ jobs:
     # One dispatch: in disposable mode the allocation steps run first (the
     # channel pin comes from them), then admission validates the build source.
     # A failed allocation fails this job and skips everything downstream.
+    # Mirror/fork deployments without an R2 release backend leave the
+    # variable unset: the dispatched run starts and every job skips green
+    # instead of failing daily on missing secrets.
+    if: vars.DESKTOP_BUNDLED_ENABLED == 'true'
     runs-on: ubuntu-24.04
     # Public root is an environment variable, not a repository variable. No
     # secret is injected into admission; downstream jobs consume its outputs.
