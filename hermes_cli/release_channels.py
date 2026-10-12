@@ -27,6 +27,16 @@ class ChannelNotFound(ChannelError):
     pass
 
 
+class ChannelAuthorityMismatch(ChannelError):
+    """The metadata names a different repository than the reader's authority.
+
+    Readers that resolve an update target must treat this as fatal. Release
+    derivation may instead read it as "this store holds no record for my
+    repository" — e.g. a fork pointed at the default public store sees the
+    upstream project's channel, which is not the fork's published identity.
+    """
+
+
 def _match(pattern: str, value: object, label: str) -> str:
     if not isinstance(value, str) or re.fullmatch(pattern, value, re.ASCII) is None:
         raise ChannelError(f"Invalid {label}")
@@ -140,7 +150,7 @@ def validate_request(value: object, *, repository: str | None = None,
     validate_name(request.get("channel"))
     actual_repo = validate_repository(request.get("repository"))
     if repository is not None and actual_repo.casefold() != repository.casefold():
-        raise ChannelError("Channel repository authority mismatch")
+        raise ChannelAuthorityMismatch("Channel repository authority mismatch")
     require_commit(request.get("commit"))
     if "controllerCommit" in request:
         require_commit(request["controllerCommit"])
@@ -210,7 +220,7 @@ def validate_record(value: object, *, name: str | None = None, repository: str |
         raise ChannelError("Channel name does not match object key")
     actual_repo = validate_repository(record.get("repository"))
     if repository is not None and actual_repo.casefold() != repository.casefold():
-        raise ChannelError("Channel repository authority mismatch")
+        raise ChannelAuthorityMismatch("Channel repository authority mismatch")
     if record.get("policy") not in _POLICIES or record.get("state") not in ("active", "retired"):
         raise ChannelError("Invalid channel policy or state")
     _integer(record.get("revision"), "channel revision", maximum=2**53 - 1)
