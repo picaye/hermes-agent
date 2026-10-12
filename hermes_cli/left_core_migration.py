@@ -10,8 +10,9 @@ reuses; memory is not a row because its plugin name comes from ``memory.provider
 * Agent start and gateway start retry once per process for the active home (Desktop users update
   through the app and never run ``hermes update``), honouring ``security.allow_lazy_installs``.
 * After a failed attempt (catalog miss or unreachable, failed install) starts skip the row for
-  :data:`STARTUP_RETRY_SECONDS`, so an offline machine pays the network round trip once, not on every
-  ``hermes chat``; ``hermes update`` always retries.
+  an hour, doubling with each further failure up to a week, so an offline
+  machine pays the network round trip once, not on every ``hermes chat``, and a home whose install
+  cannot succeed stops failing every hour; ``hermes update`` always retries.
 * A home gets the plugin automatically at most once (``_left_core_installed`` in its config.yaml):
   ``hermes plugins remove`` afterwards is the user's choice and sticks.
 
@@ -24,13 +25,13 @@ Desktop, chat); a gateway-start outcome waits for the home's first agent to deli
 from __future__ import annotations
 
 import logging
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
 from hermes_cli.memory_provider_migration import (
-    _home_consent, _home_label, _install_command, _interactive, _unattended_consent,
+    _failed_recently, _home_consent, _home_label, _install_command, _interactive,
+    _note_failure, _unattended_consent,
 )
 
 logger = logging.getLogger(__name__)
@@ -68,10 +69,15 @@ def platform_configured_on(home: Path, name: str) -> bool:
     return platform.enabled or ("enabled" not in block and bool(str(platform.token or "").strip()))
 
 
-def _toolset_listed(config: dict, names: frozenset[str]) -> bool:
-    """A toolset in *names* is selected in ``platform_toolsets`` or the top-level ``toolsets`` list."""
-    selections = list((config.get("platform_toolsets") or {}).values()) if isinstance(
-        config.get("platform_toolsets"), dict) else []
+def _toolset_listed(config: dict, names: frozenset[str], *, own_platform: str = "") -> bool:
+    """A toolset in *names* is selected in ``platform_toolsets`` or the top-level ``toolsets`` list.
+
+    *own_platform*'s row is skipped: it scopes that platform's own sessions, which only exist once the
+    platform is on (:func:`platform_configured_on`). The installers copy cli-config.yaml.example into
+    config.yaml, and it carried ``homeassistant: [hermes-homeassistant]`` until Home Assistant left core,
+    so that row alone is not use."""
+    rows = config.get("platform_toolsets")
+    selections = [sel for platform, sel in rows.items() if platform != own_platform] if isinstance(rows, dict) else []
     selections.append(config.get("toolsets"))
     return any(isinstance(sel, list) and any(str(item) in names for item in sel) for sel in selections)
 
@@ -79,9 +85,9 @@ def _toolset_listed(config: dict, names: frozenset[str]) -> bool:
 def homeassistant_in_use(home: Path, *, process_env: bool = False) -> bool:
     """What made core run Home Assistant for *home*: ``HASS_TOKEN`` in its ``.env`` (it enabled both
     the gateway platform and the tools), the platform on in its gateway config
-    (:func:`platform_configured_on`), or the ``homeassistant`` / ``hermes-homeassistant`` toolset selected for a
-    platform. *process_env* (the active home at startup only) also counts a ``HASS_TOKEN`` the
-    process received from its environment (systemd unit, Docker, shell export)."""
+    (:func:`platform_configured_on`), or the ``homeassistant`` / ``hermes-homeassistant`` toolset selected for
+    another platform or in the top-level ``toolsets`` list. *process_env* (the active home at startup only)
+    also counts a ``HASS_TOKEN`` the process received from its environment (systemd unit, Docker, shell export)."""
     from agent.secret_scope import load_env_file
     if (load_env_file(home / ".env").get("HASS_TOKEN") or "").strip():
         return True
@@ -94,7 +100,24 @@ def homeassistant_in_use(home: Path, *, process_env: bool = False) -> bool:
             pass
     if platform_configured_on(home, "homeassistant"):
         return True
-    return _toolset_listed(_read_config(home), frozenset({"homeassistant", "hermes-homeassistant"}))
+    return _toolset_listed(
+        _read_config(home), frozenset({"homeassistant", "hermes-homeassistant"}), own_platform="homeassistant")
+
+
+def spotify_in_use(home: Path, *, process_env: bool = False) -> bool:
+    """What made core's Spotify tools usable for *home*: a login stored in its ``auth.json``
+    (``providers.spotify``, written by ``hermes auth spotify``) or the ``spotify`` toolset selected
+    for a platform. The tools were opt-in and login-gated, so a client id alone is not use."""
+    import json
+    try:
+        store = json.loads((home / "auth.json").read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):  # missing/unreadable/invalid JSON: no login we can see
+        store = {}
+    providers = store.get("providers") if isinstance(store, dict) else None
+    state = providers.get("spotify") if isinstance(providers, dict) else None
+    if isinstance(state, dict) and (state.get("access_token") or state.get("refresh_token")):
+        return True
+    return _toolset_listed(_read_config(home), frozenset({"spotify"}))
 
 
 @dataclass(frozen=True)
@@ -124,6 +147,9 @@ class LeftCoreFeature:
     # prefixes it shared with the feature's tools (stripped only when the source runs the adapter).
     enable_env: tuple[str, ...] = ()
     channel_env_prefixes: tuple[str, ...] = ()
+    # Top-level command the plugin registers in place of core's ``hermes auth <cli>`` login
+    # (``hermes <cli> login|status|logout``); :func:`moved_command_hint` points the old spelling at it.
+    cli: str = ""
 
 
 LEFT_CORE: tuple[LeftCoreFeature, ...] = (
@@ -133,6 +159,12 @@ LEFT_CORE: tuple[LeftCoreFeature, ...] = (
         secret_env=("HASS_TOKEN",), private_env=("HASS_URL",),
         toolsets=("homeassistant",), off_platforms=("acp", "webhook"), platform="homeassistant",
         enable_env=("HASS_TOKEN",), channel_env_prefixes=("HASS_",),
+    ),
+    LeftCoreFeature(
+        plugin="spotify", label="Spotify", in_use=spotify_in_use,
+        unchanged="your Spotify login, the spotify toolset and the spotify_* tools are unchanged; "
+                  "`hermes auth spotify` is now `hermes spotify login`",
+        cli="spotify",
     ),
 )
 
@@ -145,6 +177,27 @@ def platform_install_hint(platform: str) -> str:
         return ""
     return (f". {feature.label} moved out of core into the '{feature.plugin}' plugin: install it with "
             f"`{_install_command(feature.plugin, Path(get_hermes_home()))}`")
+
+
+def moved_command_hint(prog: str, value: str, action: str = "") -> str:
+    """For a command a left-core plugin took over: ``hermes auth [<action>] <cli>`` (core's old login
+    spelling) or ``hermes <cli>`` while the plugin is not loaded, the line saying where it went and
+    how to get it for the active home, else ``""``."""
+    from hermes_constants import get_hermes_home
+    feature = next((f for f in LEFT_CORE if f.cli and f.cli == value), None)
+    if feature is None or prog not in {"hermes", "hermes auth"}:
+        return ""
+    home = Path(get_hermes_home())
+    install = _install_command(feature.plugin, home)
+    if not plugin_present(feature.plugin, home):
+        get = f" Install it with: `{install}`."
+    else:
+        get = f" Enable it with: `{install.replace(' install ', ' enable ')}`." if prog == "hermes" else ""
+    if prog == "hermes auth":
+        old = " ".join(p for p in ("hermes auth", action, value) if p)
+        return (f"{feature.label} moved out of core into the '{feature.plugin}' plugin: `{old}` is now "
+                f"`hermes {value} {action or 'login'}`.{get}")
+    return f"{feature.label} moved out of core into the '{feature.plugin}' plugin, which is not loaded.{get}"
 
 
 _attempted: set[str] = set()
@@ -228,30 +281,6 @@ def _record_migration(home: Path, feature: LeftCoreFeature) -> None:
     atomic_config_write(path, config)
 
 
-STARTUP_RETRY_SECONDS = 3600.0
-
-
-def _failure_stamp(home: Path, feature: LeftCoreFeature) -> Path:
-    """Touched on every failed automatic install; its mtime gates the next startup attempt."""
-    return home / "cache" / f"left-core-{feature.plugin}.failed"
-
-
-def _note_failure(home: Path, feature: LeftCoreFeature) -> None:
-    stamp = _failure_stamp(home, feature)
-    try:
-        stamp.parent.mkdir(parents=True, exist_ok=True)
-        stamp.touch()
-    except OSError as exc:
-        logger.debug("left-core retry stamp not written for %s: %s", home, exc)
-
-
-def _failed_recently(home: Path, feature: LeftCoreFeature) -> bool:
-    try:
-        return time.time() - _failure_stamp(home, feature).stat().st_mtime < STARTUP_RETRY_SECONDS
-    except OSError:
-        return False
-
-
 def _pending(home: Path, *, say: Callable[[str], None], process_env: bool = False,
              backoff: bool = False) -> list[LeftCoreFeature]:
     """Rows *home* uses whose plugin it never had and that the catalog ships (a catalog miss is
@@ -276,12 +305,12 @@ def _pending(home: Path, *, say: Callable[[str], None], process_env: bool = Fals
             continue
         if present:
             continue
-        if backoff and _failed_recently(home, feature):
-            logger.info("%s plugin install failed recently for %s; retrying after %ds or on `hermes update`",
-                        feature.label, home, STARTUP_RETRY_SECONDS)
+        if backoff and _failed_recently(home, feature.plugin):
+            logger.info("%s plugin install failed recently for %s; retrying later or on `hermes update`",
+                        feature.label, home)
             continue
         if catalog_source(feature.plugin) is None:
-            _note_failure(home, feature)
+            _note_failure(home, feature.plugin)
             say(f"  ⚠ {feature.label} moved out of core into the '{feature.plugin}' plugin, which this "
                 f"Hermes cannot find in the plugin catalog yet. Run `{_install_command(feature.plugin, home)}` "
                 f"once it is listed.")
@@ -325,7 +354,7 @@ def _install_one(home: Path, feature: LeftCoreFeature, *, install: Callable[[str
         say(f"  ✓ {feature.label} moved out of core — installed the '{feature.plugin}' plugin from the "
             f"catalog ({feature.unchanged}).")
         return True
-    _note_failure(home, feature)
+    _note_failure(home, feature.plugin)
     error = _first_cause(str(result.get("error") or ""))
     say(f"  ⚠ {feature.label} moved out of core and its '{feature.plugin}' plugin could not be installed "
         f"automatically: {error}. Run `{_install_command(feature.plugin, home)}`.")
