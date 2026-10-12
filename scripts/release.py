@@ -306,8 +306,17 @@ def get_pr_number(subject: str) -> str | None:
 
 
 def generate_changelog(commits, tag_name, semver, repo_url="https://github.com/NousResearch/hermes-agent",
-                       prev_tag=None, first_release=False, no_changelog=False):
-    """Generate markdown changelog from categorized commits."""
+                       prev_tag=None, first_release=False, no_changelog=False,
+                       max_body_chars: int | None = None):
+    """Generate markdown changelog from categorized commits.
+
+    GitHub refuses a release body over 125,000 characters. The stable path
+    leaves that case to its caller, which refuses the cut and asks for a
+    hand-written changelog; an automated caller passes ``max_body_chars``
+    and gets bullets shrunk per category until the body fits. The Full
+    Changelog link always names the complete comparison, so the
+    truncation is navigational, not lossy.
+    """
     lines = []
 
     # Header
@@ -335,10 +344,9 @@ def generate_changelog(commits, tag_name, semver, repo_url="https://github.com/N
 
     all_authors = set()
     teknium_aliases = {"@teknium1"}
+    # Group commits by category
+    categories = defaultdict(list)
     if not no_changelog:
-        # Group commits by category
-        categories = defaultdict(list)
-
         for commit in commits:
             categories[commit["category"]].append(commit)
             author = commit["github_author"]
@@ -348,27 +356,30 @@ def generate_changelog(commits, tag_name, semver, repo_url="https://github.com/N
                 if coauthor not in teknium_aliases:
                     all_authors.add(coauthor)
 
-        # Category display order and emoji
-        category_order = [
-            ("breaking", "⚠️ Breaking Changes"),
-            ("features", "✨ Features"),
-            ("improvements", "🔧 Improvements"),
-            ("fixes", "🐛 Bug Fixes"),
-            ("docs", "📚 Documentation"),
-            ("tests", "🧪 Tests"),
-            ("chore", "🏗️ Infrastructure"),
-            ("other", "📦 Other Changes"),
-        ]
+    # Category display order and emoji
+    category_order = [
+        ("breaking", "⚠️ Breaking Changes"),
+        ("features", "✨ Features"),
+        ("improvements", "🔧 Improvements"),
+        ("fixes", "🐛 Bug Fixes"),
+        ("docs", "📚 Documentation"),
+        ("tests", "🧪 Tests"),
+        ("chore", "🏗️ Infrastructure"),
+        ("other", "📦 Other Changes"),
+    ]
 
+    def category_lines(per_category: int | None) -> list[str]:
+        """The category sections, listing at most ``per_category`` bullets each."""
+        out = []
         for cat_key, cat_title in category_order:
             cat_commits = categories.get(cat_key, [])
             if not cat_commits:
                 continue
 
-            lines.append(f"## {cat_title}")
-            lines.append("")
+            out.append(f"## {cat_title}")
+            out.append("")
 
-            for commit in cat_commits:
+            for commit in cat_commits if per_category is None else cat_commits[:per_category]:
                 subject = clean_subject(commit["subject"])
                 pr_num = get_pr_number(commit["subject"])
                 author = commit["github_author"]
@@ -383,41 +394,60 @@ def generate_changelog(commits, tag_name, semver, repo_url="https://github.com/N
                 if author not in teknium_aliases:
                     parts.append(f"— {author}")
 
-                lines.append(" ".join(parts))
+                out.append(" ".join(parts))
 
-            lines.append("")
+            listed = len(cat_commits) if per_category is None else min(per_category, len(cat_commits))
+            hidden = len(cat_commits) - listed
+            if hidden:
+                out.append(f"- …and {hidden} more — see the full changelog link below")
 
-    # Contributors section
-    if all_authors:
-        # Sort contributors by commit count
-        author_counts = defaultdict(int)
-        for commit in commits:
-            author = commit["github_author"]
-            if author not in teknium_aliases:
-                author_counts[author] += 1
-            for coauthor in commit.get("coauthors", []):
-                if coauthor not in teknium_aliases:
-                    author_counts[coauthor] += 1
+            out.append("")
+        return out
 
-        sorted_authors = sorted(author_counts.items(), key=lambda x: -x[1])
+    def tail_lines() -> list[str]:
+        out = []
+        # Contributors section
+        if all_authors:
+            # Sort contributors by commit count
+            author_counts = defaultdict(int)
+            for commit in commits:
+                author = commit["github_author"]
+                if author not in teknium_aliases:
+                    author_counts[author] += 1
+                for coauthor in commit.get("coauthors", []):
+                    if coauthor not in teknium_aliases:
+                        author_counts[coauthor] += 1
 
-        lines.append("## 👥 Contributors")
-        lines.append("")
-        lines.append("Thank you to everyone who contributed to this release!")
-        lines.append("")
-        for author, count in sorted_authors:
-            commit_word = "commit" if count == 1 else "commits"
-            lines.append(f"- {author} ({count} {commit_word})")
-        lines.append("")
+            sorted_authors = sorted(author_counts.items(), key=lambda x: -x[1])
 
-    # Full changelog link
-    if prev_tag:
-        lines.append(f"**Full Changelog**: [{prev_tag}...{tag_name}]({repo_url}/compare/{prev_tag}...{tag_name})")
-    else:
-        lines.append(f"**Full Changelog**: [{tag_name}]({repo_url}/commits/{tag_name})")
-    lines.append("")
+            out.append("## 👥 Contributors")
+            out.append("")
+            out.append("Thank you to everyone who contributed to this release!")
+            out.append("")
+            for author, count in sorted_authors:
+                commit_word = "commit" if count == 1 else "commits"
+                out.append(f"- {author} ({count} {commit_word})")
+            out.append("")
 
-    return "\n".join(lines)
+        # Full changelog link
+        if prev_tag:
+            out.append(f"**Full Changelog**: [{prev_tag}...{tag_name}]({repo_url}/compare/{prev_tag}...{tag_name})")
+        else:
+            out.append(f"**Full Changelog**: [{tag_name}]({repo_url}/commits/{tag_name})")
+        out.append("")
+        return out
+
+    def assemble(per_category: int | None) -> str:
+        sections = lines + ([] if no_changelog else category_lines(per_category)) + tail_lines()
+        return "\n".join(sections)
+
+    body = assemble(None)
+    per_category = None
+    while max_body_chars is not None and len(body) > max_body_chars and per_category != 0:
+        # Halve the listed bullets per category until the automated body fits.
+        per_category = max(1, len(commits)) if per_category is None else per_category // 2
+        body = assemble(per_category)
+    return body
 
 
 def _resume_canary(tag: str, remote: str, repository: str, *, notes_file: Path | None = None) -> None:
@@ -531,8 +561,10 @@ def cmd_canary(args) -> None:
 
     version = tag_name.lstrip("v")
     print(f"Canary: {tag_name} ({len(commits)} commits since {since})")
+    from scripts.releases.entrypoint import GITHUB_BODY_LIMIT
     changelog = generate_changelog(
-        commits, tag_name, version, prev_tag=since, first_release=False, no_changelog=args.no_changelog
+        commits, tag_name, version, prev_tag=since, first_release=False,
+        no_changelog=args.no_changelog, max_body_chars=GITHUB_BODY_LIMIT,
     )
 
     if not args.publish:
