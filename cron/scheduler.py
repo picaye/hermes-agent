@@ -2500,10 +2500,15 @@ def _construct_cron_agent(AIAgent, job: dict, _cfg: dict, setup: _CronAgentSetup
 
 
 class _FireAudit:
-    """One usage_audit.jsonl line per fire (created once the agent exists; fire id + start clock)."""
+    """One usage_audit.jsonl line per fire (created once the agent exists; fire id + start clock).
 
-    def __init__(self, job: dict, job_id: str, model: str):
+    ``execution_id`` rides the receipt so the scheduler's bookkeeping can correlate the durable
+    run outcome with the executions.db row even after the job record itself is gone (a run that
+    deleted its own definition out-of-band)."""
+
+    def __init__(self, job: dict, job_id: str, model: str, execution_id: Optional[str] = None):
         self.job, self.job_id, self.model = job, job_id, model
+        self.execution_id = execution_id
         self.fire_id = uuid.uuid4().hex
         self.t_start = time.monotonic()
 
@@ -2512,6 +2517,7 @@ class _FireAudit:
             "ts": _utcnow_iso_ms(),
             "job_id": self.job_id,
             "fire_id": self.fire_id,
+            "execution_id": self.execution_id,
             "prompt_tokens": result.get("prompt_tokens"),
             "completion_tokens": result.get("completion_tokens"),
             "total_tokens": result.get("total_tokens"),
@@ -2579,7 +2585,7 @@ def run_job(
         agent = _construct_cron_agent(
             AIAgent, job, _cfg, setup, workdir=scope.workdir, session_id=_cron_session_id,
             session_db=_session_db)
-        _audit = _FireAudit(job, job_id, model)
+        _audit = _FireAudit(job, job_id, model, execution_id)
 
         result = _run_agent_with_watchdog(
             agent, prompt, job, job_id, job_name, scope.task_id, cancel_event,
@@ -2876,6 +2882,61 @@ def run_one_job(
 
 _OWNERSHIP_LOST_INTERRUPTED = "Interrupted by shutdown before terminal completion."
 
+# Tail window for the usage_audit receipt lookup: the receipt for the fire being recorded is
+# written microseconds before the lookup, so it is always among the last lines; the window keeps
+# the check O(1)-ish on a long-lived audit log.
+_USAGE_AUDIT_TAIL_BYTES = 262_144
+
+
+def _self_removed_run_has_completed_receipt(job_id: str, execution_id: Optional[str]) -> bool:
+    """True when the job record is gone from the store AND the usage_audit receipt for this fire
+    shows the run completed without error.
+
+    A run that deletes its own definition out-of-band (a terminal ``hermes cron remove``
+    subprocess, not the in-process ``self_removal_delivery_scope`` marker) loses its fire claim
+    with the record: the heartbeat can no longer validate it and the stale-result discard fires.
+    But the durable receipt proves the run itself finished — recording that as ``failed`` is a
+    false negative that masks the self-delete from every downstream monitor.
+
+    Fail-closed on every doubt: an unreadable store, a still-present record (a claim re-owned by
+    a replacement run must keep discarding its stale twin), a missing receipt, a receipt from a
+    different execution, or a receipt carrying an error all answer False.
+    """
+    from cron.jobs import load_jobs
+    try:
+        if any(item.get("id") == job_id for item in load_jobs()):
+            return False
+    except Exception:
+        logger.debug("Job '%s': cron store unreadable during self-removal receipt check",
+                     job_id, exc_info=True)
+        return False
+    try:
+        path = _usage_audit_path()
+        if not path.exists():
+            return False
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - _USAGE_AUDIT_TAIL_BYTES))
+            tail = f.read().decode("utf-8", errors="replace")
+        for line in reversed(tail.splitlines()):
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(entry, dict) or entry.get("job_id") != job_id:
+                continue
+            if execution_id is not None:
+                # Strict correlation when the caller has an execution row: an older fire's
+                # receipt (no execution_id, or a different one) is not this run's proof.
+                if entry.get("execution_id") != execution_id:
+                    continue
+            return entry.get("error") is None
+        return False
+    except Exception:
+        logger.debug("Job '%s': usage_audit read failed during self-removal receipt check",
+                     job_id, exc_info=True)
+        return False
+
 
 def _record_fire_ownership_lost(
     job: dict, fire_owner: Optional[str], execution_id: str,
@@ -2893,6 +2954,16 @@ def _record_fire_ownership_lost(
             **({"ladder_rung": True} if is_retry_run(job) else {}),
         )
         finish_execution(execution_id, success=False, error=_OWNERSHIP_LOST_INTERRUPTED)
+    elif _self_removed_run_has_completed_receipt(job_id, execution_id):
+        # The discard branch, but the record is gone because THIS run deleted it (out-of-band),
+        # and the usage_audit receipt proves the run completed cleanly. Record the completed
+        # run with a distinct ``self_removed`` delivery outcome instead of a false failure; the
+        # job has no record left to mark, so executions.db is the only surface that matters.
+        logger.info(
+            "Job '%s': fire claim ownership lost to a self-removal, but the run's usage_audit "
+            "receipt shows completion — recording the execution as completed (self_removed)",
+            job_id)
+        finish_execution(execution_id, success=True, delivery_outcome="self_removed")
     else:
         finish_execution(
             execution_id, success=False,
