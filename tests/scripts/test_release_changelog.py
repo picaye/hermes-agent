@@ -43,3 +43,27 @@ def test_an_oversized_changelog_shrinks_to_githubs_body_limit():
     assert "https://github.com/o/r/compare/v0.21.4...v0.21.5+canary.X" in body
     # The frame and the contributors section survive the shrink.
     assert "## 🐛 Bug Fixes" in body and "## 👥 Contributors" in body
+
+
+def test_the_canary_budget_leaves_headroom_for_the_builds_table_swap():
+    """desktop-bundled-release.yml later rewrites the HERMES_BUILDS_TABLE
+    marker into a run link and then the download tables, growing the body
+    after creation. cmd_canary must cap below the hard limit, not at it."""
+    from scripts import release
+    from scripts.releases.entrypoint import GITHUB_BODY_LIMIT
+
+    assert release.RELEASE_BODY_BUDGET < GITHUB_BODY_LIMIT
+    commits = [{
+        "sha": f"{i:040x}", "short_sha": f"{i:08x}", "author_name": "Dev",
+        "author_email": "dev@example.test",
+        "subject": f"fix: a long upstream subject line {i} " + "x" * 80,
+        "category": "fixes", "github_author": "@dev", "coauthors": [],
+    } for i in range(3000)]
+
+    body = release.generate_changelog(
+        commits, "v0.21.5+canary.X", "0.21.5+canary.X",
+        repo_url="https://github.com/o/r", prev_tag="v0.21.4",
+        max_body_chars=release.RELEASE_BODY_BUDGET,
+    )
+    assert len(body) <= release.RELEASE_BODY_BUDGET
+    assert GITHUB_BODY_LIMIT - len(body) >= 20_000

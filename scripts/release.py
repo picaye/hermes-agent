@@ -30,6 +30,13 @@ from scripts.releases.authors import resolve_author
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
+# GitHub rejects a release body over 125,000 characters (HTTP 422). The
+# automated canary caps its notes BELOW that hard limit, not at it: the
+# desktop-bundled-release workflow later swaps the HERMES_BUILDS_TABLE
+# marker for a run link and then for the download tables, growing the
+# body after creation. Keep headroom for that edit.
+RELEASE_BODY_BUDGET = 100_000
+
 
 def git(*args, cwd=None):
     """Run a git command and return stdout."""
@@ -481,6 +488,20 @@ def _resume_canary(tag: str, remote: str, repository: str, *, notes_file: Path |
             create, cwd=REPO_ROOT, capture_output=True, text=True, encoding="utf-8",
             check=False,
         )
+        if (created.returncode != 0 and notes_file is None
+                and "body is too long" in (created.stderr or "").lower()):
+            # GitHub's own generated notes can also blow the 125k body cap
+            # on a wide window. Fall back to a minimal body so the receipt
+            # still converges; the commits link carries the rest.
+            create = [a for a in create if a != "--generate-notes"] + [
+                "--notes",
+                f"Hermes Agent canary {tag}.\n\n"
+                f"Full changelog: https://github.com/{repository}/commits/{tag}\n",
+            ]
+            created = subprocess.run(
+                create, cwd=REPO_ROOT, capture_output=True, text=True, encoding="utf-8",
+                check=False,
+            )
         if created.returncode != 0:
             raise ValueError(created.stderr.strip() or "Canary draft could not be recovered")
         draft_url = created.stdout.strip()
@@ -561,10 +582,9 @@ def cmd_canary(args) -> None:
 
     version = tag_name.lstrip("v")
     print(f"Canary: {tag_name} ({len(commits)} commits since {since})")
-    from scripts.releases.entrypoint import GITHUB_BODY_LIMIT
     changelog = generate_changelog(
         commits, tag_name, version, prev_tag=since, first_release=False,
-        no_changelog=args.no_changelog, max_body_chars=GITHUB_BODY_LIMIT,
+        no_changelog=args.no_changelog, max_body_chars=RELEASE_BODY_BUDGET,
     )
 
     if not args.publish:
@@ -639,8 +659,25 @@ def prune_old_canaries(args) -> None:
         )
         if result.returncode == 0:
             print(f"✓ Deleted {tag}")
-        else:
+            continue
+        # A canary whose draft creation failed (e.g. the 2026-10-12 HTTP 422
+        # body-too-long runs) pushed the receipt tag and stopped: an orphan
+        # tag with no release. gh release delete cannot remove what does not
+        # exist — check for that and drop the tag itself, remote first.
+        view = subprocess.run(
+            ["gh", "release", "view", tag] + (["--repo", gh_repo] if gh_repo else []),
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            cwd=str(REPO_ROOT), check=False,
+        )
+        if view.returncode == 0:
             print(f"⚠ Could not delete {tag}: {result.stderr.strip()}")
+            continue
+        pushed = git_result("push", push_remote, f":refs/tags/{tag}")
+        if pushed.returncode != 0:
+            print(f"⚠ Could not delete orphan tag {tag}: {pushed.stderr.strip()}")
+            continue
+        git("tag", "-d", tag)
+        print(f"✓ Deleted orphan tag {tag} (no release)")
     if not args.publish:
         print("Dry run complete. No release was deleted.")
         print("Run the same command with --publish to delete the tags above.")
