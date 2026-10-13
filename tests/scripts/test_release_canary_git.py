@@ -183,3 +183,74 @@ def test_stable_dispatch_and_failure(monkeypatch, tmp_path):
     assert release.dispatch_desktop_build(
         "v1.2.3+canary.20260818T103000Z", "owner/repo"
     ) is False
+
+
+def test_prune_deletes_orphan_receipt_tags(canary_repo, monkeypatch, capsys):
+    """A canary whose draft creation failed leaves a pushed receipt tag with no
+    release (2026-10-12: the 422 body-too-long runs). gh release delete cannot
+    remove what does not exist; prune must fall back to deleting the tag."""
+    git, remote, calls = canary_repo
+    git("commit", "--allow-empty", "-qm", "stable")
+    git("tag", "v1.2.3")
+    git("commit", "--allow-empty", "-qm", "feat: next")
+    orphan = "v1.2.3+canary.20261012T164623Z"
+    git("tag", "-a", orphan, "-m", "Hermes Agent canary 20261012T164623Z")
+    git("push", "origin", f"refs/tags/{orphan}")
+    assert git("--git-dir", str(remote), "rev-parse", f"refs/tags/{orphan}")
+
+    fixture_run = subprocess.run
+
+    def run(argv, *args, **kwargs):
+        if argv[0] == "gh" and argv[1:3] in (["release", "delete"], ["release", "view"]):
+            calls.append(argv)
+            return subprocess.CompletedProcess(argv, 1, "", "not found")
+        return fixture_run(argv, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", run)
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 10, 27, tzinfo=UTC)
+
+    monkeypatch.setattr(release, "datetime", Clock)
+    release.prune_old_canaries(SimpleNamespace(remote="origin", publish=True))
+
+    out = capsys.readouterr().out
+    assert f"✓ Deleted orphan tag {orphan} (no release)" in out
+    assert not git("tag", "--list", orphan)
+    assert git("--git-dir", str(remote), "tag", "--list").splitlines() == []
+
+
+def test_resume_falls_back_to_minimal_notes_when_generated_notes_are_too_long(canary_repo, monkeypatch):
+    """The --generate-notes resume path must survive the same 125k cap: on a
+    body-too-long 422, retry once with a minimal body instead of stranding the
+    receipt tag."""
+    git, _remote, calls = canary_repo
+    git("commit", "--allow-empty", "-qm", "stable")
+    git("tag", "v1.2.3")
+    git("commit", "--allow-empty", "-qm", "feat: next")
+    tag = "v1.2.3+canary.20261012T164623Z"
+    git("tag", "-a", tag, "-m", "Hermes Agent canary 20261012T164623Z")
+    git("push", "origin", f"refs/tags/{tag}")
+
+    fixture_run = subprocess.run
+    state = {"failed": False}
+
+    def run(argv, *args, **kwargs):
+        if argv[0] == "gh" and argv[1:3] == ["release", "create"] \
+                and "--generate-notes" in argv and not state["failed"]:
+            state["failed"] = True
+            calls.append(argv)
+            return subprocess.CompletedProcess(
+                argv, 1, "", "gh: http 422: body is too long (max 125000)")
+        return fixture_run(argv, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", run)
+
+    release._resume_canary(tag, "origin", "fixture/release")
+
+    creates = [call for call in calls if call[1:3] == ["release", "create"]]
+    assert len(creates) == 2
+    assert "--generate-notes" not in creates[1] and "--notes" in creates[1]
+    assert any(call[1:3] == ["workflow", "run"] for call in calls)
