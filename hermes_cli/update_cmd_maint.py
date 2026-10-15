@@ -1043,6 +1043,13 @@ def _run_post_update_maintenance(
         detail = (getattr(exc, "stderr", None) or str(exc)).strip().splitlines()[-1:] or [type(exc).__name__]
         print(f"  ⚠ Could not refresh release history ({detail[0]}); the version label may be stale or unknown until the next update")
 
+    # Post-deploy invariant guard (fork): a detached upstream-tag checkout silently drops
+    # fork fixes (twice in Oct-2026). Flag it and prove designated fixes are ancestors of
+    # HEAD before the completion line prints success. Best-effort: never fails the update.
+    with _best_effort('Post-deploy guard check failed: %s'):
+        from hermes_cli.deploy_guard import guard_after_checkout
+        guard_after_checkout(Path(_m().PROJECT_ROOT))
+
     # Seed the model-catalog cache from the checkout instead of a bot-gated, flaky fetch.
     with _best_effort('Model catalog seed during update failed: %s'):
         from hermes_cli.model_catalog import seed_cache_from_checkout

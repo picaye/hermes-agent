@@ -5778,6 +5778,15 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     from gateway.code_skew import record_boot_fingerprint
     record_boot_fingerprint()
 
+    # Post-deploy invariant guard (fork): prove designated fork fixes are ancestors of the
+    # code this boot is loading. A detached upstream-tag checkout (the Oct-2026 failure mode
+    # that dropped fork fixes twice) is flagged into deploy_guard.jsonl, never fatal.
+    try:
+        from hermes_cli.deploy_guard import guard_after_checkout
+        guard_after_checkout()
+    except Exception:
+        logger.debug("post-deploy guard skipped at gateway boot", exc_info=True)
+
     # Multiplex-only: the ONE host gateway decides first. Attach to it, make it serve this profile,
     # replace it (--replace) or refuse — before anything below binds a port or claims a PID file.
     _host_decision = await _host_attach_or_none(replace, force)
