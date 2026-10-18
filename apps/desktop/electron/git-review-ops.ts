@@ -8,7 +8,7 @@ import { execFile } from 'node:child_process'
 import fs from 'node:fs/promises'
 import path from 'node:path'
 
-import simpleGit from 'simple-git'
+import { simpleGit } from 'simple-git'
 
 import { resolveRequestedPathForIpc } from './hardening'
 import { execGit, noConsoleGitEnv, simpleGitBinary, windowsGitHost } from './no-console-git'
@@ -19,13 +19,13 @@ const REVIEW_FILE_CAP = 2_000
 const UNTRACKED_LINE_COUNT_CONCURRENCY = 16
 const UNTRACKED_LINE_COUNT_MAX_BYTES = 1024 * 1024
 
-// simple-git 3.x validates a custom binary path against an ASCII whitelist —
-// `isBadArgument` in node_modules/simple-git/dist/cjs/index.js accepts only
+// simple-git validates a custom binary path against an ASCII whitelist — the
+// binary plugin in node_modules/simple-git/dist/index.cjs accepts only
 // `/^([a-z]:)?([a-z0-9/.\_~-]+)$/i`. Everything outside it is "restricted": a
 // space in the default `C:\Program Files\Git\...`, the parentheses in
 // `Program Files (x86)`, the accented user name in `C:\Users\João\...`. Without
-// the escape hatch simple-git THROWS on such a path; with it, it console.warns
-// this exact message — the flag only downgrades the throw. Exported so gitFor
+// the escape hatch simple-git THROWS with this exact message; with it, v4 is
+// silent (v3 console.warned it on every factory call). Exported so gitFor
 // and its tests share one source of truth.
 export const SIMPLE_GIT_UNSAFE_BINARY_WARN =
   'Invalid value supplied for custom binary, restricted characters must be removed or supply the unsafe.allowUnsafeCustomBinary option'
@@ -89,27 +89,14 @@ function gitFor(cwd, gitBin) {
     return makeGit()
   }
 
-  // With the escape hatch set, simple-git still console.warns that same message on
-  // every factory call — the flag only downgrades the throw to a warning. The
-  // binary was resolved by this process, never supplied by the renderer, so on
-  // Windows (where the standard git lives under a spaced "Program Files") that
-  // warning is pure console spam. Filter exactly that message, for the
-  // synchronous factory call only.
-  const originalWarn = console.warn
+  // v4 is silent once the hatch is set — the filter that used to wrap this call
+  // suppressed a v3 console.warn that no longer exists. The hatch itself is
+  // still required: without it the factory throws
+  // SIMPLE_GIT_UNSAFE_BINARY_WARN, pinned in git-review-ops.test.ts so an
+  // upgrade that rewords or drops the guard fails the test, not production.
+  const git = makeGit()
 
-  console.warn = (message?: unknown, ...rest: unknown[]) => {
-    if (typeof message !== 'string' || !message.startsWith(SIMPLE_GIT_UNSAFE_BINARY_WARN)) {
-      originalWarn(message, ...rest)
-    }
-  }
-
-  try {
-    const git = makeGit()
-
-    return Array.isArray(binary) ? git.env(noConsoleGitEnv(process.env, gitBin || 'git')) : git
-  } finally {
-    console.warn = originalWarn
-  }
+  return Array.isArray(binary) ? git.env(noConsoleGitEnv(process.env, gitBin || 'git')) : git
 }
 
 // simple-git reports renames as `old => new` (and `dir/{old => new}/f`); resolve
