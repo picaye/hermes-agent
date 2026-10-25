@@ -4,7 +4,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 
-import simpleGit from 'simple-git'
+import { simpleGit } from 'simple-git'
 import { afterEach, test, vi } from 'vitest'
 
 import {
@@ -97,11 +97,11 @@ test('gitFor accepts a Windows no-console host tuple with restricted characters'
   }
 })
 
-test('gitFor suppresses only the known custom-binary warning and restores console.warn', () => {
+test('gitFor accepts a restricted binary only via the v4 unsafe hatch, which still guards the factory', () => {
   const spacedBin = String.raw`C:\Program Files\Git\cmd\git.exe`
   // `windowsGitHost()` resolves nothing in this process (no configured roots, no
   // HERMES_DESKTOP_PYTHON), so `gitBin` itself is what simple-git validates — the
-  // spaced `Program Files` path, which warns once per factory call.
+  // spaced `Program Files` path, which needs the allowUnsafeCustomBinary hatch.
   const warnings: unknown[][] = []
   const originalWarn = console.warn
 
@@ -118,16 +118,23 @@ test('gitFor suppresses only the known custom-binary warning and restores consol
 
     assert.equal(console.warn, recordingWarn)
 
-    // The escape hatch used directly still warns: the message gitFor filters is a
-    // live emission of the installed simple-git, so the filter cannot go stale
-    // silently (an upgrade that rewords it fails this test, not production).
+    // v4 is silent when the hatch is set (v3 console.warned the message on every
+    // factory call). The live drift guard moved to the throw side: without the
+    // hatch the factory must still throw this exact message, so an upgrade that
+    // rewords or drops the guard fails here, not production.
     simpleGit({ baseDir: process.cwd(), binary: spacedBin, unsafe: { allowUnsafeCustomBinary: true } })
+
+    assert.throws(
+      () => simpleGit({ baseDir: process.cwd(), binary: spacedBin }),
+      (error: unknown) => String((error as Error)?.message ?? error).startsWith(SIMPLE_GIT_UNSAFE_BINARY_WARN)
+    )
+
     console.warn('unrelated warning')
   } finally {
     console.warn = originalWarn
   }
 
-  assert.deepEqual(warnings, [[SIMPLE_GIT_UNSAFE_BINARY_WARN], ['unrelated warning']])
+  assert.deepEqual(warnings, [['unrelated warning']])
 })
 
 test('resolveRenamePath: simple rename resolves to the new path', () => {
