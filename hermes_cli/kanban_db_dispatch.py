@@ -1554,6 +1554,28 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
         )
 
 
+def _blockers_all_resolved(conn: sqlite3.Connection, task_id: str) -> bool:
+    """True when ``task_id`` has at least one recorded blocker (``task_links``
+    parent) and every blocker is ``done`` or ``archived``.
+
+    Requires a positive resolution signal: a task with zero blocker links never
+    recorded the external condition the stamped failure was waiting on, so it
+    must NOT be treated as "wait over" — its quota/auth suppression stands until
+    a real run supersedes the stamp, the breaker trips, or an operator clears it.
+    A blocker that regresses (done → ready) re-arms the suppression: the check
+    reads live status every tick, in both directions.
+    """
+    counts = conn.execute(
+        "SELECT COUNT(*) AS blockers, "
+        "       COALESCE(SUM(CASE WHEN p.status NOT IN ('done', 'archived') "
+        "                         THEN 1 ELSE 0 END), 0) AS open_blockers "
+        "FROM task_links l JOIN tasks p ON p.id = l.parent_id "
+        "WHERE l.child_id = ?",
+        (task_id,),
+    ).fetchone()
+    return counts[0] > 0 and counts[1] == 0
+
+
 def check_respawn_guard(
     conn: sqlite3.Connection, task_id: str, *, lane: str = "ready",
 ) -> Optional[str]:
@@ -1566,7 +1588,8 @@ def check_respawn_guard(
     checked BEFORE ``blocker_auth`` because the requeue stamps a quota-flavored
     ``last_failure_error`` that would otherwise park the task forever — that
     path never increments ``consecutive_failures``), ``"blocker_auth"``
-    (quota/auth pattern; the breaker still trips eventually), then for the
+    (quota/auth pattern; released within one tick once every recorded blocker
+    parent is done/archived — see :func:`_blockers_all_resolved`), then for the
     ready lane only ``"recent_success"`` (completed run within the window, unless
     a re-queue event arrived after it — a deliberate re-run) and ``"active_pr"``
     (PR URL in a recent comment; re-spawning risks a duplicate PR — unless a
@@ -1618,9 +1641,22 @@ def check_respawn_guard(
     # crash is different: its persisted error includes the worker's last
     # captured output, which is context rather than a diagnosis and may contain
     # benign commands such as ``claude auth status`` (#117097).
+    # State-driven release: the stamp is a snapshot of an external condition,
+    # while the board's blocker model (``task_links`` parents) records the open
+    # cards that condition was waiting on.  Once every recorded blocker is
+    # done/archived the wait is objectively over — suppress one tick at a time,
+    # never permanently — analogous to ``active_pr``'s 24h expiry but keyed to
+    # live state instead of the clock.  Without it a closed blocker freezes a
+    # ready lane forever: ``complete_task`` is the only stamp-clearer and the
+    # guard is what prevents the completion.
     err = _kb._lossy_text(row["last_failure_error"])
     latest_outcome = latest_run["outcome"] if latest_run is not None else None
-    if err and latest_outcome != "crashed" and _RESPAWN_BLOCKER_RE.search(err):
+    if (
+        err
+        and latest_outcome != "crashed"
+        and _RESPAWN_BLOCKER_RE.search(err)
+        and not _blockers_all_resolved(conn, task_id)
+    ):
         return "blocker_auth"
 
     # Review-lane spawns stop here: a recent completed run and a fresh PR URL
