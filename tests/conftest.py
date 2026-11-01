@@ -1097,30 +1097,69 @@ def _remove_relocated_basetemp(config) -> None:
 def _processes_with_hermes_home_under(roots) -> list[int]:
     """PIDs (never this process) whose environment names a ``HERMES_HOME`` inside one of *roots*.
 
-    Linux only (``/proc/<pid>/environ``; unreadable entries are another user's and skipped).
-    Elsewhere the scan is empty: a test-spawned daemon there is the per-test guard's problem.
+    Linux reads ``/proc/<pid>/environ`` (unreadable entries are another user's and skipped);
+    macOS has no ``/proc``, so the equivalent readback for same-user processes is ``ps eww``,
+    scanned only over the small candidate set whose argv names the detached ``gateway run``.
+    A launchd-reparented grandchild (ppid 1) is invisible to every per-test subprocess patch,
+    and an ``--idle-exit`` gateway does not reliably self-exit (six survived five days at
+    ~250 MB each in Oct 2026), so Darwin reaps them here like Linux does.
     """
-    if not sys.platform.startswith("linux") or not os.path.isdir("/proc"):
-        return []
     resolved = [Path(r).resolve() for r in roots if r]
+    if sys.platform.startswith("linux") and os.path.isdir("/proc"):
+        found = []
+        for entry in os.scandir("/proc"):
+            if not entry.name.isdigit() or int(entry.name) == os.getpid():
+                continue
+            try:
+                with open(f"/proc/{entry.name}/environ", "rb") as handle:
+                    environ = handle.read().split(b"\0")
+            except OSError:
+                continue
+            home = next((item[12:] for item in environ if item.startswith(b"HERMES_HOME=")), None)
+            if not home:
+                continue
+            try:
+                path = Path(os.fsdecode(home)).resolve()
+            except (OSError, ValueError):
+                continue
+            if any(path == root or path.is_relative_to(root) for root in resolved):
+                found.append(int(entry.name))
+        return found
+    if sys.platform == "darwin":
+        return _darwin_processes_with_hermes_home_under(resolved)
+    return []
+
+
+def _darwin_processes_with_hermes_home_under(resolved) -> list[int]:
+    # hermes-ops t_cc2119cc (local-only patch pending upstream): same-user environment
+    # readback via ps(1), bounded to processes whose argv names a ``gateway run`` so the
+    # per-file session teardown costs two cheap subprocesses, never a full /proc walk.
+    import subprocess
+
+    def _ps(args, timeout):
+        try:
+            return subprocess.run(args, check=False, capture_output=True, text=True, encoding="utf-8",
+                                  errors="replace", stdin=subprocess.DEVNULL, timeout=timeout).stdout
+        except (OSError, subprocess.SubprocessError):
+            return ""
+
+    def _home_of(pid: str):
+        for token in _ps(["ps", "eww", "-p", pid], 5).split():
+            if token.startswith("HERMES_HOME="):
+                try:
+                    return Path(os.fsdecode(token[12:])).resolve()
+                except (OSError, ValueError):
+                    return None
+        return None
+
     found = []
-    for entry in os.scandir("/proc"):
-        if not entry.name.isdigit() or int(entry.name) == os.getpid():
+    for line in _ps(["ps", "-axww", "-o", "pid=,command="], 15).splitlines():
+        pid, _, command = line.strip().partition(" ")
+        if not pid.isdigit() or int(pid) == os.getpid() or "gateway run" not in command:
             continue
-        try:
-            with open(f"/proc/{entry.name}/environ", "rb") as handle:
-                environ = handle.read().split(b"\0")
-        except OSError:
-            continue
-        home = next((item[12:] for item in environ if item.startswith(b"HERMES_HOME=")), None)
-        if not home:
-            continue
-        try:
-            path = Path(os.fsdecode(home)).resolve()
-        except (OSError, ValueError):
-            continue
-        if any(path == root or path.is_relative_to(root) for root in resolved):
-            found.append(int(entry.name))
+        home = _home_of(pid)
+        if home is not None and any(home == root or home.is_relative_to(root) for root in resolved):
+            found.append(int(pid))
     return found
 
 
