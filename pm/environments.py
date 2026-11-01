@@ -17,8 +17,57 @@ from pathlib import Path
 from hermes_constants import get_default_hermes_root, project_venv_dir
 
 
+def _linked_checkout_canonical_root(root: Path) -> Path | None:
+    """The canonical checkout whose ``.git`` dir a linked worktree points at, else ``None``.
+
+    Reads the same files git and :func:`hermes_cli.update_lock._git_common_dir` do — the
+    ``gitdir:`` pointer in ``.git``, then ``commondir`` — and asks no git process (this runs
+    pre-import on every boot). A linked worktree is recognised only by its exact
+    ``<common>/worktrees/<name>`` layout, which excludes submodules (whose gitdir *is* the
+    common dir and carries no ``commondir`` file). The answer must be a Hermes checkout that
+    still exists; a moved/deleted main checkout or a non-Hermes repo yields ``None`` so the
+    tree keeps its own identity and the usual repair hint still applies.
+    """
+    dot = root / ".git"
+    try:
+        if not dot.is_file():
+            return None  # a directory: root is itself canonical; absent: not a checkout
+        text = dot.read_text(encoding="utf-8-sig").strip()
+        if not text.startswith("gitdir:"):
+            return None
+        gitdir = Path(os.path.normpath(root / text[len("gitdir:"):].strip()))
+        commondir = gitdir / "commondir"
+        if not commondir.is_file():
+            return None
+        common = Path(os.path.normpath(gitdir / commondir.read_text(encoding="utf-8-sig").strip()))
+        # Case-insensitive filesystems may spell the same dir differently; resolve first.
+        if gitdir.parent.resolve() != (common / "worktrees").resolve():
+            return None
+        canonical = common.parent.resolve()
+    except (OSError, ValueError):
+        return None
+    if canonical == root or not (canonical / "hermes_bootstrap.py").is_file():
+        return None
+    return canonical
+
+
+def canonical_checkout_root(project_root: Path) -> Path:
+    """The checkout that owns this tree's dependency identity.
+
+    A linked git worktree shares its main checkout's lockfiles and dependency set, but it is
+    a distinct path, so keying dependency state on the path alone handed every new worktree
+    an install with nothing committed — a worker spawned into one died in the pre-import
+    gate (``NoCommittedEnvironment``) until someone ran ``hermes pm repair`` for that
+    throwaway key, and each campaign left another ~200 MB orphan behind (pm.install_states).
+    Attribute a linked worktree to its canonical checkout so all worktrees of one repo boot
+    on that checkout's committed environment. Every other tree resolves to itself.
+    """
+    root = Path(project_root).resolve()
+    return _linked_checkout_canonical_root(root) or root
+
+
 def install_key(project_root: Path) -> str:
-    canonical = str(Path(project_root).resolve())
+    canonical = str(canonical_checkout_root(project_root))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
 
 
@@ -137,7 +186,10 @@ def record_activation_inputs(stamps: Path, mtimes: dict[str, int], project_root:
     # The sentinel is inherited by child shells; equal input mtimes in another
     # checkout must never make their test interpreter appear current here.
     stamps.mkdir(parents=True, exist_ok=True)
-    (stamps / ".project-root").write_text(str(Path(project_root).resolve()), encoding="utf-8")
+    # The canonical checkout, never a linked worktree: pm.install_states reclaims a
+    # state dir when the recorded root is provably deleted, and worktrees are deleted
+    # routinely while their checkout lives on — recording one would GC the shared install.
+    (stamps / ".project-root").write_text(str(canonical_checkout_root(project_root)), encoding="utf-8")
     if test_environment:
         (stamps / ".test-environment").touch()
     for name, mtime in mtimes.items():

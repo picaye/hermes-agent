@@ -1,10 +1,11 @@
 """Reclaim per-checkout dependency state whose checkout is gone.
 
 Dependency state lives under ``<home>/installs/<install_key>`` where the key hashes the
-checkout path (:func:`pm.environments.install_key`). Every ``hermes -w`` worktree, review tree
-or scratch clone that boots the agent therefore commits a full environment (venv, test venv,
-PM runtime, ~200 MB each), and nothing removed it when the tree was deleted: one developer
-host carried 402 such orphans (80 GB) after a fortnight of worktree campaigns.
+checkout path (:func:`pm.environments.install_key`). Review trees or scratch clones that boot
+the agent therefore commit a full environment (venv, test venv, PM runtime, ~200 MB each), and
+nothing removed it when the tree was deleted: one developer host carried 402 such orphans
+(80 GB) after a fortnight of worktree campaigns. Linked worktrees no longer add to this:
+:func:`pm.environments.canonical_checkout_root` folds them into their checkout's key.
 
 The state dir records the checkout it belongs to in ``inputs/.project-root`` (written by
 :func:`pm.environments.record_activation_inputs`). A missing path alone does not prove the
