@@ -973,6 +973,17 @@ def _prepare_profile_gateway_update_restart(profile: str, pid: int) -> str | Non
     """
     argv = _capture_gateway_argv(pid)
     if argv and "--external-supervisor" in argv:
+        # Route precedence (t_8eb8d661, host ruling on the t_4d8f6e29 gate): an EXPLICIT
+        # --external-supervisor promise outranks the launchd-ownership probe on EVERY platform —
+        # exactly how the gateway itself decides (service_restart_route_trusted() trusts the
+        # opt-in env the flag stamps before any launchctl proof, and
+        # test_darwin_explicit_optin_env_not_disproven pins that order at the probe seam). The
+        # updater must not second-guess the same claim with a different precedence, or a
+        # flag-carrying gateway that self-decides exit-75 races the updater's watcher into a
+        # double start. Incident coverage (t_946dd633) lives in the AMBIENT marker claims —
+        # launchd identity without the explicit flag — which are disproven at the gateway's own
+        # pause-for-update/SIGUSR1 seam (reported back as restart_route='detached') and at
+        # _supervisor_markers' XPC branch via _launchd_owns_gateway_pid().
         return "external-supervisor"
     if launch_detached_profile_gateway_restart(profile, pid):
         return "detached"
@@ -1523,6 +1534,54 @@ def _locate_launchd_gateway_service(label: str) -> tuple[str | None, int | None]
 def _probe_launchd_service_running() -> bool:
     """True when the plist exists AND launchd is running a process for the current label."""
     return get_launchd_plist_path().exists() and _launchctl_label_supervising_process(get_launchd_label())
+
+
+def _launchd_owns_gateway_pid(pid: int) -> bool:
+    """Trust-vs-ownership proof for a launchd-flavored supervision claim on ``pid`` (t_4d8f6e29).
+
+    ``--external-supervisor`` on a gateway's argv, or a set ``XPC_SERVICE_NAME``, proves the marker
+    EXISTS — not that launchd spawned this process. A job whose domain is on-demand-only answers
+    ``launchctl`` with its definition while never running a process ("pending spawn"), and a
+    desktop-session launch inherits markers from its parent chain; handing either back to launchd
+    with exit 75 strands the gateway — observed: the whole fleet stayed dead ~2h25m after
+    ``hermes update`` asked a boot-started, launchd-invisible gateway to "hand back" (root cause
+    t_946dd633). The proof that IS decisive: the live PID launchd reports for the claimed label is
+    ``pid`` itself or one of its ancestors (the plist's stderr-timestamp wrapper is the job process;
+    the gateway runs below it).
+
+    Returns True (claim not disproven) off darwin — custom systemd units and the explicit
+    ``HERMES_GATEWAY_EXTERNAL_SUPERVISOR`` opt-in env promise are per-launch/operator evidence that
+    launchctl cannot mirror. On darwin an unreadable environment (other-user process) also falls
+    back to the canonical label probe rather than trusting nothing.
+    """
+    if sys.platform != "darwin":
+        return True
+    from gateway.restart import (
+        EXTERNAL_GATEWAY_SUPERVISOR_ENV, launchd_job_label, launchd_running_job_pid,
+        process_ancestor_pids,
+    )
+    env: dict[str, str] = {}
+    try:
+        import psutil  # type: ignore
+        env = psutil.Process(pid).environ()
+    except Exception:  # health: allow BLE001 — unreadable env is common for foreign processes; probe canonical label instead
+        env = {}
+    if str(env.get(EXTERNAL_GATEWAY_SUPERVISOR_ENV, "")).strip().lower() in ("1", "true", "yes", "on"):
+        return True
+    label = launchd_job_label(env)
+    if label is None:
+        xpc = str(env.get("XPC_SERVICE_NAME", "") or "").strip()
+        if xpc and xpc != "0" and not xpc.startswith("application."):
+            # A custom launchd job stamped its own label directly on this process — probe that label.
+            label = xpc
+    if label is None:
+        label = get_launchd_label()
+    job_pid = launchd_running_job_pid(label)
+    if job_pid is None:
+        return False
+    if job_pid == pid:
+        return True
+    return job_pid in process_ancestor_pids(pid)
 
 
 def _s6_gateway_snapshot(gateway_pids: tuple[int, ...]) -> GatewayRuntimeSnapshot | None:

@@ -321,12 +321,24 @@ async def _start_gateway_start_control_socket(runner):
                 _drain = float(_get_restart_drain_timeout())
             except Exception:
                 _drain = 30.0
+            # Trust vs ownership (t_4d8f6e29): the updater chose the pause verb because it believes a
+            # supervisor (or its own watcher) will relaunch after the exit. Exit-75 alone strands a
+            # process launchd never spawned — verify this process is actually service-owned before
+            # taking that route, and arm the detached self-relaunch helper when it is not.
+            from gateway.restart import service_restart_route_trusted
+            trusted, route_reason = service_restart_route_trusted()
+            if not trusted:
+                logger.warning(
+                    "pause-for-update: no restarting supervisor owns this gateway (%s) — arming the "
+                    "detached self-relaunch helper so the post-update code comes back up regardless "
+                    "of what the updater's hand-back assumed.", route_reason,
+                )
             accepted_box: list[bool] = []
             _done = threading.Event()
 
             def _request() -> None:
                 try:
-                    accepted_box.append(runner.request_restart(detached=False, via_service=True))
+                    accepted_box.append(runner.request_restart(detached=not trusted, via_service=trusted))
                 finally:
                     _done.set()
 
@@ -335,7 +347,12 @@ async def _start_gateway_start_control_socket(runner):
             accepted = bool(accepted_box and accepted_box[0])
             return {
                 "pausing": accepted, "already_stopping": not accepted,
-                "pid": os.getpid(), "drain_timeout": _drain}
+                "pid": os.getpid(), "drain_timeout": _drain,
+                # Tell the updater the truth about this process's supervision (t_4d8f6e29): a caller
+                # that assumed the "external-supervisor" hand-back can switch to watching for the
+                # detached helper's fresh PID instead of waiting on launchctl.
+                "supervised": trusted, "restart_route": "service" if trusted else "detached",
+            }
 
         def _rescan_profiles_handler() -> dict:
             """``hermes profile create/delete`` asks the multiplexer to reconcile ``profiles/`` now

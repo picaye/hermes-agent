@@ -4828,7 +4828,26 @@ def _start_gateway_make_restart_signal_handler(runner):
             "SIGUSR1 received (systemctl reload / hermes gateway restart): performing a graceful "
             "gateway restart — drain active turns, exit, supervisor relaunches. Not an in-process "
             "config reload.")
-        runner.request_restart(detached=False, via_service=True)
+        # Trust vs ownership (t_4d8f6e29): exit-75 only revives the gateway if a service manager
+        # actually OWNS this process — a marker inherited from a desktop session or a launchd job
+        # that never spawned us is not a respawn promise. Unowned: self-relaunch detached instead
+        # of going dark with nobody obligated to bring us back.
+        from gateway.restart import GATEWAY_SERVICE_RESTART_EXIT_CODE, is_gateway_supervisor_process, service_restart_route_trusted
+        trusted, reason = service_restart_route_trusted()
+        if not trusted:
+            if is_gateway_supervisor_process():
+                logger.error(
+                    "SIGUSR1 restart: refusing the exit-%d service hand-back — %s. Restarting via the "
+                    "detached self-relaunch helper so the fleet survives; if this launch was meant to "
+                    "be a service, verify it: hermes gateway install && hermes gateway status.",
+                    GATEWAY_SERVICE_RESTART_EXIT_CODE, reason,
+                )
+            else:
+                logger.info(
+                    "SIGUSR1 restart: no service manager owns this process (%s) — using the detached "
+                    "self-relaunch helper instead of exit %d.", reason, GATEWAY_SERVICE_RESTART_EXIT_CODE,
+                )
+        runner.request_restart(detached=not trusted, via_service=trusted)
     return restart_signal_handler
 
 

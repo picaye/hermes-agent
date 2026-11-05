@@ -182,8 +182,15 @@ def _home_of(pid: int) -> str | None:
 def _supervisor_markers(pid: int) -> str | None:
     """Why *pid* answers to a supervisor other than a hermes unit/job (it would respawn it on old
     code), or ``None``."""
-    from hermes_cli.gateway import _capture_gateway_argv
+    from hermes_cli.gateway import _capture_gateway_argv, _launchd_owns_gateway_pid
     if "--external-supervisor" in (_capture_gateway_argv(pid) or []):
+        # Route precedence (t_8eb8d661): the EXPLICIT --external-supervisor promise outranks the
+        # launchd-ownership probe on every platform — the gateway itself trusts this opt-in (the
+        # flag stamps HERMES_GATEWAY_EXTERNAL_SUPERVISOR into its env) before any launchctl proof
+        # in service_restart_route_trusted(), so the updater must not apply the opposite order.
+        # The incident shape (t_946dd633) — launchd identity markers with no job actually running
+        # the process — is still disproven where it is only AMBIENT: the XPC branch below and the
+        # gateway's own pause-for-update/SIGUSR1 seam.
         return "--external-supervisor"
     try:
         import psutil  # type: ignore
@@ -195,8 +202,10 @@ def _supervisor_markers(pid: int) -> str | None:
     if unit := _respawning_service(pid):
         return f"systemd unit {unit}"
     # launchd names terminal apps' shells application.<bundle id>; those are not KeepAlive jobs.
+    # A non-"0" XPC name is still only an identity marker: launchctl must show the job running
+    # THIS process or its wrapper ancestor before we hand it back (t_4d8f6e29).
     xpc = env.get("XPC_SERVICE_NAME", "0")
-    if xpc not in ("", "0") and not xpc.startswith("application."):
+    if xpc not in ("", "0") and not xpc.startswith("application.") and _launchd_owns_gateway_pid(pid):
         return f"launchd job {xpc}"
     return None
 

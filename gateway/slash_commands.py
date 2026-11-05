@@ -590,8 +590,22 @@ class GatewaySlashCommandsMixin(
         # Under a service manager (systemd/launchd) or Docker/Podman, exit 75 so the supervisor /
         # restart policy restarts us — detached setsid+bash fails there (systemd KillMode=mixed kills
         # the cgroup; tini exits with the gateway). The explicit marker covers ``sudo env -i`` wrappers.
-        from gateway.restart import is_container_restart_context, is_gateway_supervisor_process
-        via_service = is_gateway_supervisor_process() or is_container_restart_context()
+        # Trust vs ownership (t_4d8f6e29): env markers answer existence, not ownership — a launchd
+        # job that never spawned this process will not relaunch an exit 75. Verify the pid chain
+        # before choosing the hand-back; fall back to the detached self-relaunch otherwise.
+        from gateway.restart import (
+            GATEWAY_SERVICE_RESTART_EXIT_CODE, is_container_restart_context,
+            is_gateway_supervisor_process, service_restart_route_trusted,
+        )
+        via_service, route_reason = service_restart_route_trusted()
+        if not via_service and is_container_restart_context():
+            via_service, route_reason = True, "container restart policy"
+        if not via_service and is_gateway_supervisor_process():
+            logger.error(
+                "/restart: supervisor marker present but no manager OWNS this process (%s) — "
+                "refusing exit-%d hand-back and using the detached self-relaunch path instead.",
+                route_reason, GATEWAY_SERVICE_RESTART_EXIT_CODE,
+            )
         self.request_restart(detached=not via_service, via_service=via_service)
         # Track sessions that were active at shutdown for stuck-loop detection (#7536). On each restart, the
         # counter increments for sessions that were running. If a session hits the threshold (3 consecutive

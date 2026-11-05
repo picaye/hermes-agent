@@ -16,6 +16,8 @@ make it exit non-zero with nothing to revive it.
 """
 from unittest.mock import MagicMock
 
+import os
+
 import pytest
 
 import gateway.run as gateway_run
@@ -91,3 +93,36 @@ def test_supervised_child_marker_is_a_launch_not_a_restart_route():
     assert is_gateway_supervisor_process(task_env) is False
     assert is_supervised_gateway_launch({}) is False
     assert is_supervised_gateway_launch({"INVOCATION_ID": "abc"}) is True
+
+
+# ---------------------------------------------------------------- t_4d8f6e29: ownership, not markers
+
+@pytest.mark.asyncio
+async def test_restart_launchd_marker_without_job_ownership_falls_back_to_detached(
+    tmp_path, monkeypatch
+):
+    """A gateway wearing launchd identity that the job never spawned (on-demand-only domain) must
+    not exit 75 — launchd owes it no relaunch. Route to the detached self-relaunch instead."""
+    runner = _make_runner_with_mock_restart(tmp_path, monkeypatch)
+    monkeypatch.setenv("XPC_SERVICE_NAME", "ai.hermes.gateway")
+    monkeypatch.setattr("gateway.restart.launchd_running_job_pid", lambda label: None)
+
+    await runner._handle_restart_command(_make_restart_event())
+
+    runner.request_restart.assert_called_once_with(detached=True, via_service=False)
+
+
+@pytest.mark.asyncio
+async def test_restart_launchd_wrapper_ancestor_keeps_service_handback(tmp_path, monkeypatch):
+    """No behavior change for a genuine launchd-managed grandchild: the job's live PID is the
+    plist wrapper, an ancestor of this process."""
+    runner = _make_runner_with_mock_restart(tmp_path, monkeypatch)
+    monkeypatch.setenv("XPC_SERVICE_NAME", "0")
+    monkeypatch.setenv("HERMES_LAUNCHD_LABEL", "ai.hermes.gateway")
+    wrapper_pid = os.getpid() + 1  # stand-in for the launchd job process above us
+    monkeypatch.setattr("gateway.restart.launchd_running_job_pid", lambda label: wrapper_pid)
+    monkeypatch.setattr("gateway.restart.process_ancestor_pids", lambda pid: [wrapper_pid, 1])
+
+    await runner._handle_restart_command(_make_restart_event())
+
+    runner.request_restart.assert_called_once_with(detached=False, via_service=True)
