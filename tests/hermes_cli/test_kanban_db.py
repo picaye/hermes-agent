@@ -720,6 +720,119 @@ def test_delete_task_removes_task_and_cascades(kanban_home):
         assert len(kb.list_runs(conn, t)) == 0
 
 
+# ---------------------------------------------------------------------------
+# Deletion audit trail (t_327e01b8) — purged cards stay queryable
+# ---------------------------------------------------------------------------
+
+
+def test_archive_purge_sequence_leaves_one_queryable_deletion_record(kanban_home):
+    """AC2: an archive→``--rm`` purge leaves EXACTLY ONE queryable deletion
+    record per purged id, and a re-run of the purge appends no second row."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="ephemeral card", assignee="worker")
+        kb.add_comment(conn, tid, "user", "scratch")
+        kb.claim_task(conn, tid)
+        kb.complete_task(conn, tid, result="done")
+        assert kb.archive_task(conn, tid)
+        assert kb.delete_archived_task(
+            conn, tid, actor="dev", source="cli:archive --rm",
+        ) is True
+
+        # Task row and all relations are still purged as before...
+        assert kb.get_task(conn, tid) is None
+        for table in ("task_comments", "task_events", "task_runs"):
+            assert conn.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE task_id = ?", (tid,)
+            ).fetchone()[0] == 0
+
+        # ...but the durable audit record survives and is queryable.
+        rec = kb.get_deletion(conn, tid)
+        assert rec is not None
+        assert rec["task_id"] == tid
+        assert rec["title"] == "ephemeral card"
+        assert rec["status"] == "archived"
+        assert rec["assignee"] == "worker"
+        assert rec["deleted_by"] == "dev"
+        assert rec["source"] == "cli:archive --rm"
+        assert rec["deleted_at"] > 0
+        snap = json.loads(rec["snapshot"])
+        assert snap["id"] == tid and snap["title"] == "ephemeral card"
+
+        # Purging the same id again is a no-op and does NOT double-record.
+        assert kb.delete_archived_task(conn, tid, actor="dev", source="cli:archive --rm") is False
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_deletions WHERE task_id = ?", (tid,)
+        ).fetchone()[0] == 1
+
+
+def test_bulk_purge_records_every_id_exactly_once(kanban_home):
+    """The ``archive --rm <many ids>`` bulk path records each purge once."""
+    with kbc.connect() as conn:
+        ids = []
+        for i in range(3):
+            tid = kb.create_task(conn, title=f"card-{i}")
+            assert kb.archive_task(conn, tid)
+            assert kb.delete_archived_task(
+                conn, tid, actor="cli", source="cli:archive --rm",
+            ) is True
+            ids.append(tid)
+        rows = conn.execute("SELECT task_id FROM task_deletions").fetchall()
+        assert sorted(r["task_id"] for r in rows) == sorted(ids)
+
+
+def test_two_step_safety_unchanged_and_writes_no_audit_row(kanban_home):
+    """AC3: a non-archived task still returns False from delete_archived_task
+    and must not produce a deletion record (nothing was deleted)."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="still live")
+        assert kb.delete_archived_task(conn, tid, actor="cli", source="cli:archive --rm") is False
+        assert kb.get_task(conn, tid) is not None
+        assert kb.get_deletion(conn, tid) is None
+        assert kb.list_deletions(conn) == []
+
+
+def test_delete_task_audit_and_recompute_ready_unaffected(kanban_home):
+    """AC2: the dashboard ``delete_task`` path audits the purge AND its
+    trailing ``recompute_ready`` still promotes the orphaned child."""
+    with kbc.connect() as conn:
+        parent = kb.create_task(conn, title="blocking parent")
+        child = kb.create_task(conn, title="waiting child", parents=[parent])
+        assert kb.get_task(conn, child).status == "todo"
+
+        assert kb.delete_task(conn, parent, source="dashboard:DELETE /tasks (board=default)") is True
+
+        rec = kb.get_deletion(conn, parent)
+        assert rec is not None
+        assert rec["task_id"] == parent
+        assert rec["status"] == "ready"  # status captured at deletion time
+        assert rec["deleted_by"] is None
+        assert rec["source"].startswith("dashboard:")
+
+        # Parent links were purged, so recompute_ready promotes the child.
+        assert kb.get_task(conn, child).status == "ready"
+
+
+def test_list_deletions_since_filters_sweep_baseline(kanban_home, monkeypatch):
+    """``list_deletions(since=...)`` — the query surface sweeps use to rebuild
+    dedupe/exemption baselines — filters by ``deleted_at``."""
+    with kbc.connect() as conn:
+        old = kb.create_task(conn, title="old card")
+        assert kb.archive_task(conn, old)
+        assert kb.delete_archived_task(conn, old)
+        watermark = kb.get_deletion(conn, old)["deleted_at"] + 1
+        # Shift the clock so the fresh purge lands strictly after the
+        # watermark regardless of second-boundary truncation.
+        real_time = time.time
+        monkeypatch.setattr(kb.time, "time", lambda: real_time() + 3600)
+        fresh = kb.create_task(conn, title="fresh card")
+        assert kb.archive_task(conn, fresh)
+        assert kb.delete_archived_task(conn, fresh)
+
+        since_rows = kb.list_deletions(conn, since=watermark)
+        assert [r["task_id"] for r in since_rows] == [fresh]
+        all_rows = kb.list_deletions(conn)
+        assert [r["task_id"] for r in all_rows] == [old, fresh]  # oldest first
+
 
 
 # ---------------------------------------------------------------------------
