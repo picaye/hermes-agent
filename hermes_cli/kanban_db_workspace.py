@@ -11,6 +11,7 @@ import os
 import shutil
 import sqlite3
 import subprocess
+import sys
 import time
 import unicodedata
 from pathlib import Path
@@ -686,8 +687,68 @@ def _repo_root_for_worktree_target(path: Path) -> Optional[Path]:
         current = current.parent
 
 
+# Cold PM provisioning (venv closure from the lockfile) measured ~2 min on
+# warm caches; the bound exists to cap a hung network/build, not the happy path.
+_WORKTREE_PM_PROVISION_TIMEOUT_SECONDS = 900
+
+
+def _provision_hermes_worktree_env(target: Path) -> None:
+    """Commit a dependency environment for a fresh worktree of a Hermes
+    checkout (t_39461905, cto decision option a).
+
+    A linked worktree has its own PM install key — ``sha256`` of its resolved
+    path — and nothing used to provision it. Worker spawn runs
+    ``sys.executable -m ...`` with cwd=the lane, so the lane tree lands first
+    on ``sys.path``, PM resolves the worktree key, finds no
+    ``~/.hermes/installs/<key>/facts.json``, and every boot raises
+    ``NoCommittedEnvironment`` until a human runs ``pm repair`` by hand.
+
+    Provisioning rides the official repair boundary as a subprocess with
+    ``cwd=target``: PM refuses to repair a tree foreign to its own process
+    (the root guard in ``pm.recovery.repair_dependencies``), and
+    ``hermes_cli.main`` dispatches ``pm`` before any application dependency
+    import — so the call works from the still-unprovisioned lane itself. The
+    one-time cold cost (~2 min per new worktree card) is the accepted
+    trade for per-lane isolation. Best-effort: failure only logs; the lane
+    is left exactly as it was before the fix, never worse.
+    """
+    if not (target / "hermes_bootstrap.py").is_file():
+        return  # not a hermes-agent checkout — there is no PM env to commit
+    argv = [sys.executable, "-m", "hermes_cli.main", "pm", "repair"]
+    try:
+        result = subprocess.run(
+            argv,
+            check=False,
+            cwd=str(target),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=_WORKTREE_PM_PROVISION_TIMEOUT_SECONDS,
+            stdin=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        _kb._log.warning("kanban: worktree pm provisioning failed for %s: %s", target, exc)
+        return
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip().splitlines()
+        _kb._log.warning(
+            "kanban: worktree pm provisioning exited %s for %s: %s",
+            result.returncode,
+            target,
+            " | ".join(detail[-3:]),
+        )
+        return
+    _kb._log.info("kanban: committed dependency environment for worktree %s", target)
+
+
 def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> None:
-    """Materialize ``target`` as a linked git worktree under ``repo_root``."""
+    """Materialize ``target`` as a linked git worktree under ``repo_root``.
+
+    A freshly created lane of a Hermes checkout is provisioned before any
+    worker can boot on it (:func:`_provision_hermes_worktree_env`); an
+    existing lane returns early and keeps whatever environment it has.
+    """
     target = target.expanduser()
     repo_common = _git_common_dir(repo_root)
     if target.exists() and repo_common is not None and _path_key(_git_common_dir(target)) == _path_key(repo_common):
@@ -703,6 +764,7 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
         raise RuntimeError(
             f"git worktree add failed for {target} on branch {branch_name}: {stderr}"
         )
+    _provision_hermes_worktree_env(target)
 
 
 def _anchored_worktree(repo_root: Path, task_id: str, branch_name: str) -> tuple[Path, str]:
