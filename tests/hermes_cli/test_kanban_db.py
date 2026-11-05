@@ -600,6 +600,16 @@ def test_infrastructure_spawn_refusal_never_charges_the_card(
     failure on the same card still counts."""
     from tools import process_registry
 
+    # Environment assumption made explicit: the real boundary is reached
+    # through an OS gate (`if not _IS_LINUX:` in
+    # restart_safe_gateway_child_argv) that short-circuits to "in_process"
+    # before any of the probes below are consulted. The scenario this test
+    # models — a systemd-managed Linux gateway refusing to place a worker — only
+    # exists on Linux, so pin the gate exactly like the other environment
+    # probes. Without this the test is host-dependent: on macOS/Windows the
+    # boundary never refuses, the spawn falls into the ordinary-failure path,
+    # and the breaker charges the card.
+    monkeypatch.setattr(process_registry, "_IS_LINUX", True)
     monkeypatch.setattr(process_registry, "_is_supervised_gateway_process", lambda: True)
     monkeypatch.setenv("INVOCATION_ID", "managed-gateway")
     monkeypatch.setattr(process_registry, "_systemd_run_user_scope_available", lambda: False)
