@@ -35,8 +35,14 @@ def darwin(monkeypatch):
     monkeypatch.setattr(gw, "get_launchd_label", lambda: LABEL)
 
 
-def test_off_darwin_claim_is_not_disproven():
-    """Custom systemd units and non-macOS supervisors keep today's hand-back behaviour."""
+def test_off_darwin_claim_is_not_disproven(monkeypatch):
+    """Custom systemd units and non-macOS supervisors keep today's hand-back behaviour.
+
+    Pin the platform (t_8eb8d661): every other test in this file pins ``darwin`` via the
+    ``darwin`` fixture; without a pin this one runs the REAL launchd probe on a macOS host,
+    where fake PID 4242 is owned by no job and the off-darwin short-circuit is not exercised.
+    """
+    monkeypatch.setattr(gw.sys, "platform", "linux")
     assert gw._launchd_owns_gateway_pid(GATEWAY_PID) is True
 
 
@@ -86,18 +92,43 @@ def test_darwin_explicit_optin_env_not_disproven(darwin, monkeypatch):
 
 
 # ------------------------------------------------------------------ route integration
+#
+# Precedence ruling (t_8eb8d661, host gate on t_4d8f6e29): an EXPLICIT --external-supervisor
+# promise (argv flag, which the gateway also stamps as HERMES_GATEWAY_EXTERNAL_SUPERVISOR in its
+# own env) outranks the launchd-ownership probe on EVERY platform at the updater sites — the same
+# order gateway.restart.service_restart_route_trusted() uses and test_darwin_explicit_optin_env_not_disproven
+# pins at the probe seam. The probe decides only AMBIENT launchd claims (self-declared
+# supervisor=="launchd", bare XPC_SERVICE_NAME) — the marker shape that stranded the fleet in
+# t_946dd633.
 
-def test_update_restart_arms_own_watcher_when_launchd_does_not_own_the_process(
-    monkeypatch, tmp_path
-):
-    """``_prepare_profile_gateway_update_restart`` must stop returning "external-supervisor"
-    (which leaves the fleet to launchd, which never ran it) and arm the updater's detached
-    watcher instead — the recovery the 13:04-15:28 outage lacked."""
+
+def test_darwin_updater_route_explicit_flag_outranks_ownership_probe(monkeypatch):
+    """Updater seam mirror of ``test_darwin_explicit_optin_env_not_disproven``: with the explicit
+    flag on the gateway's argv the route must return the hand-back WITHOUT consulting the probe."""
     monkeypatch.setattr(gw.sys, "platform", "darwin")
     monkeypatch.setattr(gw, "get_launchd_label", lambda: LABEL)
     monkeypatch.setattr(gw, "_capture_gateway_argv",
                         lambda pid: ["python", "-m", "hermes_cli.main", "gateway", "run", "--external-supervisor"])
-    monkeypatch.setattr(gw, "_launchd_owns_gateway_pid", lambda pid: False)
+
+    def _never(pid):
+        raise AssertionError("the launchd-ownership probe must not gate an explicit opt-in")
+
+    monkeypatch.setattr(gw, "_launchd_owns_gateway_pid", _never)
+    monkeypatch.setattr(gw, "launch_detached_profile_gateway_restart",
+                        lambda *_a: pytest.fail("detached watcher must not be launched"))
+
+    assert gw._prepare_profile_gateway_update_restart("work", GATEWAY_PID) == "external-supervisor"
+
+
+def test_update_restart_arms_own_watcher_when_no_explicit_flag(monkeypatch):
+    """Without the explicit promise the updater still arms its own watcher — and a gateway whose
+    ambient launchd claim is disproven takes the detached self-relaunch at its own seam
+    (pause-for-update reports restart_route='detached'), which is what the 13:04-15:28 outage
+    lacked (t_946dd633)."""
+    monkeypatch.setattr(gw.sys, "platform", "darwin")
+    monkeypatch.setattr(gw, "get_launchd_label", lambda: LABEL)
+    monkeypatch.setattr(gw, "_capture_gateway_argv",
+                        lambda pid: ["python", "-m", "hermes_cli.main", "gateway", "run", "--replace"])
     armed = []
     monkeypatch.setattr(gw, "launch_detached_profile_gateway_restart",
                         lambda profile, pid: armed.append((profile, pid)) or True)
@@ -109,32 +140,80 @@ def test_update_restart_arms_own_watcher_when_launchd_does_not_own_the_process(
 
 
 def test_update_restart_still_hands_back_to_a_real_launchd_job(monkeypatch):
-    """No behavior change for genuine launchd-managed instances."""
+    """No behavior change for genuine launchd-managed instances — and the flag short-circuits
+    before the probe on every platform."""
     monkeypatch.setattr(gw, "_capture_gateway_argv",
                         lambda pid: ["python", "-m", "hermes_cli.main", "gateway", "run", "--external-supervisor"])
-    monkeypatch.setattr(gw, "_launchd_owns_gateway_pid", lambda pid: True)
+
+    def _never(pid):
+        raise AssertionError("launchctl must not be consulted for an explicit opt-in")
+
+    monkeypatch.setattr(gw, "_launchd_owns_gateway_pid", _never)
 
     assert gw._prepare_profile_gateway_update_restart("default", GATEWAY_PID) == "external-supervisor"
+
+
+def test_posix_pause_flag_beats_probe_on_darwin(darwin, monkeypatch):
+    """``hermes update``'s pause route treats the explicit flag as the promise, never probing
+    launchctl — precedence identical to the restart route on every platform."""
+    from hermes_cli import update_cmd_posix_pause as posix_pause
+
+    monkeypatch.setattr(gw, "_capture_gateway_argv",
+                        lambda pid: ["python", "-m", "hermes_cli.main", "gateway", "run", "--external-supervisor"])
+
+    def _never(pid):
+        raise AssertionError("launchctl must not be consulted for an explicit opt-in")
+
+    monkeypatch.setattr(gw, "_launchd_owns_gateway_pid", _never)
+    assert posix_pause._supervisor_markers(GATEWAY_PID) == "--external-supervisor"
+
+
+def test_posix_pause_ambient_launchd_claim_is_disproven(darwin, monkeypatch):
+    """The incident shape at the updater pause route: launchd identity WITHOUT the explicit flag
+    must not be trusted when no job runs the process — otherwise the updater pauses and the
+    'respawn on old code' never happens."""
+    from hermes_cli import update_cmd_posix_pause as posix_pause
+
+    monkeypatch.setattr(gw, "_capture_gateway_argv", lambda pid: ["python", "-m", "hermes_cli.main", "gateway", "run"])
+    monkeypatch.setattr(posix_pause, "_respawning_service", lambda pid: None)
+    _fake_psutil(monkeypatch, {"XPC_SERVICE_NAME": LABEL})
+    monkeypatch.setattr(gr, "launchd_running_job_pid", lambda label: None)
+    assert posix_pause._supervisor_markers(GATEWAY_PID) is None
 
 
 def test_gateway_declares_external_supervisor_false_when_job_runs_nothing(
     monkeypatch, tmp_path
 ):
-    """``hermes gateway restart`` must not hand a marker-only gateway to ``SIGUSR1 + wait for
-    launchd`` — that path has no restart observer, so a disproven claim now falls through to the
-    manual stop + foreground-start fallback, which recovers the gateway by itself."""
+    """``hermes gateway restart`` must not hand an AMBIENT launchd marker gateway to ``SIGUSR1 +
+    wait for launchd`` — that path has no restart observer, so a disproven claim now falls through
+    to the manual stop + foreground-start fallback, which recovers the gateway by itself."""
     monkeypatch.setattr(gw.sys, "platform", "darwin")
-    monkeypatch.setattr("gateway.control_socket.identify_gateway", lambda home, **k: None)
-    monkeypatch.setattr(gw, "_capture_gateway_argv",
-                        lambda pid: ["python", "-m", "hermes_cli.main", "gateway", "run", "--external-supervisor"])
+    monkeypatch.setattr("gateway.control_socket.identify_gateway",
+                        lambda home, **k: {"pid": GATEWAY_PID, "launch_supervisor": "launchd"})
+    monkeypatch.setattr(gw, "_capture_gateway_argv", lambda pid: None)
     monkeypatch.setattr(gw, "_launchd_owns_gateway_pid", lambda pid: False)
     assert supervised.gateway_declares_external_supervisor(GATEWAY_PID, home=tmp_path) is False
 
 
 def test_gateway_declares_external_supervisor_true_for_owned_process(monkeypatch, tmp_path):
     monkeypatch.setattr(gw.sys, "platform", "darwin")
+    monkeypatch.setattr("gateway.control_socket.identify_gateway",
+                        lambda home, **k: {"pid": GATEWAY_PID, "launch_supervisor": "launchd"})
+    monkeypatch.setattr(gw, "_capture_gateway_argv", lambda pid: None)
+    monkeypatch.setattr(gw, "_launchd_owns_gateway_pid", lambda pid: True)
+    assert supervised.gateway_declares_external_supervisor(GATEWAY_PID, home=tmp_path) is True
+
+
+def test_gateway_declares_external_supervisor_explicit_flag_beats_probe(monkeypatch, tmp_path):
+    """Precedence at the ``gateway restart`` site too: an explicit ``--external-supervisor`` argv
+    promise is honored without consulting launchctl, on every platform."""
+    monkeypatch.setattr(gw.sys, "platform", "darwin")
     monkeypatch.setattr("gateway.control_socket.identify_gateway", lambda home, **k: None)
     monkeypatch.setattr(gw, "_capture_gateway_argv",
                         lambda pid: ["python", "-m", "hermes_cli.main", "gateway", "run", "--external-supervisor"])
-    monkeypatch.setattr(gw, "_launchd_owns_gateway_pid", lambda pid: True)
+
+    def _never(pid):
+        raise AssertionError("launchctl must not be consulted for an explicit opt-in")
+
+    monkeypatch.setattr(gw, "_launchd_owns_gateway_pid", _never)
     assert supervised.gateway_declares_external_supervisor(GATEWAY_PID, home=tmp_path) is True

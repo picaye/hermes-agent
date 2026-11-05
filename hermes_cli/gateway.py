@@ -973,18 +973,18 @@ def _prepare_profile_gateway_update_restart(profile: str, pid: int) -> str | Non
     """
     argv = _capture_gateway_argv(pid)
     if argv and "--external-supervisor" in argv:
-        # Trust vs ownership (t_4d8f6e29): the flag proves the wrapper STAMPED it, not that launchd
-        # spawned this process. If no launchd job runs it (on-demand-only domain, desktop-session
-        # launch with inherited markers), the "hand back" is a hand to nobody — the gateway exits 75
-        # and nothing relaunches it. Disprove that shape here and arm the updater's own watcher.
-        if _launchd_owns_gateway_pid(pid):
-            return "external-supervisor"
-        _print_lines(
-            f"⚠ Gateway PID {pid} carries --external-supervisor but no launchd job runs it — the "
-            "flag came from inherited session markers, not supervision.",
-            "  Arming the updater's detached restart watcher instead of trusting a hand-back that",
-            "  would leave the gateway dead (t_4d8f6e29).",
-        )
+        # Route precedence (t_8eb8d661, host ruling on the t_4d8f6e29 gate): an EXPLICIT
+        # --external-supervisor promise outranks the launchd-ownership probe on EVERY platform —
+        # exactly how the gateway itself decides (service_restart_route_trusted() trusts the
+        # opt-in env the flag stamps before any launchctl proof, and
+        # test_darwin_explicit_optin_env_not_disproven pins that order at the probe seam). The
+        # updater must not second-guess the same claim with a different precedence, or a
+        # flag-carrying gateway that self-decides exit-75 races the updater's watcher into a
+        # double start. Incident coverage (t_946dd633) lives in the AMBIENT marker claims —
+        # launchd identity without the explicit flag — which are disproven at the gateway's own
+        # pause-for-update/SIGUSR1 seam (reported back as restart_route='detached') and at
+        # _supervisor_markers' XPC branch via _launchd_owns_gateway_pid().
+        return "external-supervisor"
     if launch_detached_profile_gateway_restart(profile, pid):
         return "detached"
     if argv and launch_detached_gateway_restart_by_cmdline(pid, list(argv)):

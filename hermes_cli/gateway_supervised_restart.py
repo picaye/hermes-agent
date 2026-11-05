@@ -53,10 +53,14 @@ def gateway_declares_external_supervisor(pid: int, home: Path | None = None) -> 
         argv = record.get("argv") if record.get("pid") == pid else None
     if not (bool(argv) and "--external-supervisor" in argv):
         return False
-    # Trust vs ownership (t_4d8f6e29): the flag proves the plist-shaped command exists, not that
-    # launchd OWNS this process. Off darwin the answer is unchanged (custom systemd units are the
-    # documented purpose); on darwin a job that runs no matching process cannot honor the hand-back.
-    return _launchd_owns_gateway_pid(pid)
+    # Route precedence (t_8eb8d661): the explicit --external-supervisor promise in the gateway's own
+    # argv outranks the launchd-ownership probe on every platform — the gateway trusts the same
+    # opt-in (which its startup stamps into HERMES_GATEWAY_EXTERNAL_SUPERVISOR) before any launchctl
+    # proof when it picks its own restart route, and reports that choice back to us over the control
+    # socket (restart_route). Probing here with the opposite order would arm a competing relaunch
+    # behind a hand-back the gateway has already committed to. Ambient launchd identity WITHOUT the
+    # explicit flag is still disproven above (self-declared supervisor == "launchd" path).
+    return True
 
 
 def _wait_for_supervised_gateway_replacement(
