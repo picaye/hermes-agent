@@ -1,0 +1,33 @@
+{
+  "_comment": "Designated fork fixes on picaye/hermes-agent: commits that MUST be ancestors of every deployed checkout HEAD and of the running gateway's code_sha. The post-deploy guard (hermes_cli/deploy_guard.py) asserts this after every updater checkout move and gateway boot. Add an entry when a fork-only fix must never be silently dropped by a detached-tag deploy; drop entries once the fix is merged upstream.",
+  "designated_fixes": [
+    {
+      "sha": "e623e8575e53f511bf3c181cf6a5b47804532567",
+      "why": "fix(cron): self-removing job with completed usage_audit receipt records completed, not false-FAILED (dropped by the 2026-10-15 detached-tag deploy, restored by 8f65f7a0f4)"
+    },
+    {
+      "sha": "e9f54bc03fdfd74c4630d3992c42f2be37663359",
+      "why": "fix(release): a foreign repository's channel record is not this repo's published identity (canary RED root cause)"
+    },
+    {
+      "sha": "820392186c2acd3d1f94a24f33ebc106c4948168",
+      "why": "fix(release): fit an automated canary changelog inside GitHub's 125k body limit"
+    },
+    {
+      "sha": "68fc221f09c9d5c137aa93c04c3b842d072a3bd6",
+      "why": "fix(deps): npm lockfile bumps for the post-sync Dependabot wave (Oct-12)"
+    },
+    {
+      "sha": "4a0b89fbc4ff1055d9c919e3f4887fe8e2122da2",
+      "why": "fix(deps): urllib3 2.8.0 + tornado 6.5.10 in uv.lock (Dependabot wave)"
+    },
+    {
+      "sha": "68957b81b12853db919b5d3ec005a5eab5711530",
+      "why": "fix(release): canary body headroom, notes-422 fallback, orphan tag prune (+ nix runner fix)"
+    },
+    {
+      "sha": "03c56dbaf19a686b7fe05d8d7cadb6406f77fca3",
+      "why": "ci: gate desktop-bundled-release on DESKTOP_BUNDLED_ENABLED so forks without R2 stay green"
+    }
+  ]
+}

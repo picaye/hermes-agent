@@ -5091,6 +5091,14 @@ async def _host_attach_or_none(replace: bool, force: bool = False) -> Optional[b
 async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = False,
                         verbosity: Optional[int] = 0, force: bool = False, idle_exit: bool = False) -> bool:
     """Run the process lifecycle; the runner facade remains the public entrypoint."""
+    # Post-deploy invariant guard (fork): prove designated fork fixes are ancestors of the
+    # code this boot is loading. A detached upstream-tag checkout (the Oct-2026 failure mode
+    # that dropped fork fixes twice) is flagged into deploy_guard.jsonl, never fatal.
+    try:
+        from hermes_cli.deploy_guard import guard_after_checkout
+        guard_after_checkout()
+    except Exception:
+        logger.debug("post-deploy guard skipped at gateway boot", exc_info=True)
     from gateway.run_bootstrap import start_gateway as bootstrap
     return await bootstrap(config, replace, verbosity, force, idle_exit)
 
