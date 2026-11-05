@@ -990,6 +990,28 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
+-- Durable audit trail for hard deletes (t_327e01b8). ``archive --rm`` and
+-- the dashboard DELETE route purge a task row AND every related row —
+-- including its task_events — via _delete_task_relations(), so a purged
+-- card was 100% invisible to board-history queries and sweep
+-- dedupe/exemption baselines. One row is appended per successful delete,
+-- INSIDE the delete transaction and BEFORE the purge, capturing a final
+-- snapshot of the card. Rows are keyed by the deleted task id and are
+-- DELIBERATELY not purged by _delete_task_relations() — they must
+-- outlive the task they describe.
+CREATE TABLE IF NOT EXISTS task_deletions (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id      TEXT NOT NULL,
+    title        TEXT,
+    status       TEXT,
+    assignee     TEXT,
+    tenant       TEXT,
+    deleted_at   INTEGER NOT NULL,
+    deleted_by   TEXT,
+    source       TEXT,
+    snapshot     TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
 CREATE INDEX IF NOT EXISTS idx_links_parent          ON task_links(parent_id);
@@ -999,6 +1021,7 @@ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, start
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+CREATE INDEX IF NOT EXISTS idx_deletions_task        ON task_deletions(task_id, deleted_at);
 """
 
 
@@ -3853,29 +3876,121 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
 
 
 def _delete_task_relations(conn: sqlite3.Connection, task_id: str) -> None:
-    """Delete every row referencing ``task_id`` (schema has no ON DELETE CASCADE)."""
+    """Delete every row referencing ``task_id`` (schema has no ON DELETE CASCADE).
+
+    ``task_deletions`` is deliberately NOT listed here: its rows must
+    outlive the task they describe (audit trail for the purge, t_327e01b8).
+    """
     conn.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (task_id, task_id))
     for table in ("task_comments", "task_events", "task_runs", "kanban_notify_subs"):
         conn.execute(f"DELETE FROM {table} WHERE task_id = ?", (task_id,))
 
 
-def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
+def _append_deletion_audit(
+    conn: sqlite3.Connection,
+    task_row: sqlite3.Row,
+    *,
+    actor: Optional[str] = None,
+    source: Optional[str] = None,
+) -> None:
+    """Append the durable audit record for one hard delete, inside the
+    caller's delete transaction and BEFORE :func:`_delete_task_relations`
+    purges the task's events/comments/runs.
+
+    ``task_row`` is the full ``tasks`` row captured while the task still
+    exists. The card stays queryable afterwards via
+    :func:`list_deletions` — board history and sweep dedupe/exemption
+    baselines no longer go blind on purge (t_327e01b8).
+    """
+    task_id = task_row["id"]
+    conn.execute(
+        "INSERT INTO task_deletions "
+        "(task_id, title, status, assignee, tenant, deleted_at, deleted_by, source, snapshot) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            task_id,
+            task_row["title"],
+            task_row["status"],
+            task_row["assignee"],
+            task_row["tenant"],
+            int(time.time()),
+            actor,
+            source,
+            _json_or_null({k: task_row[k] for k in task_row.keys()}),
+        ),
+    )
+
+
+def get_deletion(conn: sqlite3.Connection, task_id: str) -> Optional[dict]:
+    """Most recent deletion audit row for ``task_id``, or ``None`` if the
+    task was never purged. Survives ``_delete_task_relations`` by design."""
+    row = conn.execute(
+        "SELECT * FROM task_deletions WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def list_deletions(
+    conn: sqlite3.Connection,
+    *,
+    since: Optional[int] = None,
+    limit: Optional[int] = None,
+) -> list[dict]:
+    """Deletion audit rows (oldest first), optionally filtered to
+    ``deleted_at >= since`` — the queryable board-history surface for
+    purged cards."""
+    q = "SELECT * FROM task_deletions"
+    args: list = []
+    if since is not None:
+        q += " WHERE deleted_at >= ?"
+        args.append(since)
+    q += " ORDER BY id ASC"
+    if limit is not None:
+        q += " LIMIT ?"
+        args.append(int(limit))
+    return [dict(r) for r in conn.execute(q, args).fetchall()]
+
+
+def delete_archived_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    actor: Optional[str] = None,
+    source: Optional[str] = None,
+) -> bool:
     """Hard-delete an ARCHIVED task (+ related rows); anything else must be
-    archived first so data loss takes two deliberate actions."""
+    archived first so data loss takes two deliberate actions. A durable
+    ``task_deletions`` audit row is appended before the purge."""
     with write_txn(conn):
-        if _task_status(conn, task_id) != "archived":
+        row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if row is None or row["status"] != "archived":
             return False
+        _append_deletion_audit(conn, row, actor=actor, source=source)
         _delete_task_relations(conn, task_id)
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         return cur.rowcount == 1
 
 
-def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Hard-delete a task and its related rows in one txn; False when not found."""
+def delete_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    actor: Optional[str] = None,
+    source: Optional[str] = None,
+) -> bool:
+    """Hard-delete a task and its related rows in one txn; False when not found.
+    A durable ``task_deletions`` audit row is appended before the purge."""
     with write_txn(conn):
-        cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
-        if cur.rowcount != 1:
+        row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if row is None:
             return False
+        # BEGIN IMMEDIATE serializes writers, so between the SELECT above and
+        # this DELETE no concurrent commit can remove the row: rowcount == 1.
+        conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+        # Audit BEFORE the relations purge: the record must outlive the rows
+        # _delete_task_relations() removes (t_327e01b8).
+        _append_deletion_audit(conn, row, actor=actor, source=source)
         _delete_task_relations(conn, task_id)
     recompute_ready(conn)
     return True
