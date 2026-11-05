@@ -195,3 +195,42 @@ def test_ladder_reruns_do_not_spend_extra_repeat_budget(tmp_cron_home, monkeypat
     assert held == [True, True, True, False]
     # But a rung whose limit was edited down to the count does retire the job: send its notice.
     assert not ur.will_retry(dict(runs[1], repeat={"times": 1, "completed": 1}))
+
+
+class _FakeAgent:
+    def __init__(self, session_api_calls: int = 0):
+        self.session_api_calls = session_api_calls
+
+
+def test_provider_side_abort_with_zero_api_calls_is_retryable():
+    """The 2026-10-30/31 engine-stall class: HTTP 503 'engine exited before ready' and the
+    stale circuit-breaker abort wrapped in RuntimeErrors must open the ladder (the
+    preflight transient classifier does not match these strings)."""
+    engine_exit = RuntimeError(
+        "HTTP 503: the engine exited before it was ready (see /home/strata/Strata/logs/engine.out)")
+    stale_abort = RuntimeError(
+        "Provider has been unresponsive (no response received) for 5 consecutive stale "
+        "attempts — aborting this call to avoid piling up requests against a dead provider.")
+    assert ur.is_model_unreachable_failure(engine_exit, _FakeAgent()) is True
+    assert ur.is_model_unreachable_failure(stale_abort, _FakeAgent()) is True
+    # Reaching through the cause chain works too.
+    wrapped = RuntimeError("provider call failed")
+    wrapped.__cause__ = engine_exit
+    assert ur.is_model_unreachable_failure(wrapped, _FakeAgent()) is True
+
+
+def test_provider_side_abort_gate_respects_completed_api_calls():
+    """A 503-class abort AFTER the model was reached (API calls completed) is NOT retried —
+    side effects may already have happened."""
+    engine_exit = RuntimeError("HTTP 503: the engine exited before it was ready")
+    assert ur.is_model_unreachable_failure(engine_exit, _FakeAgent(3)) is False
+
+
+def test_non_abort_errors_stay_out_of_the_ladder():
+    """4xx/auth, HTTP 500 and unrelated failures must not qualify."""
+    assert ur.is_model_unreachable_failure(
+        RuntimeError("HTTP 401: Invalid API key"), _FakeAgent()) is False
+    assert ur.is_model_unreachable_failure(
+        RuntimeError("HTTP 500: internal server error"), _FakeAgent()) is False
+    assert ur.is_model_unreachable_failure(
+        ValueError("agent hit iteration cap"), _FakeAgent()) is False
