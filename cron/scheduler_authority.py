@@ -158,7 +158,7 @@ def reconcile_pending(*, allow_connect=True):
     from cron.executions import execution_owner_live, get_execution
     from cron.jobs import get_job, pause_job
     from cron.scheduler import (_RunDelivery, _FireOwnership, _apply_agent_failure_marker,
-                                _save_compose_deliver)
+                                _save_compose_deliver, _fire_secret_scope)
     from cron.scheduler_bookkeeping import fail_empty_response, finish_completed_run
     from utils import atomic_json_write
     import logging
@@ -221,8 +221,15 @@ def reconcile_pending(*, allow_connect=True):
             # The canonical receipt supplies the result; a dead scheduler's fire claim does not
             # authorize replay and must not prevent finishing its durable bookkeeping.
             fence = _FireOwnership(dict(job, fire_claim=None))
-            _save_compose_deliver(delivery, fence, answer, output, adapters=None, loop=None,
-                                 verbose=False, execution_token=None)
+            # The compose/deliver chain resolves <PLATFORM>_HOME_* secrets through get_secret
+            # (origin fallback probes every registered platform, e.g. matrix's MATRIX_HOME_ROOM).
+            # Under multi-profile hosting get_secret fails closed outside a scope — the same
+            # contract _run_one_job_body._install_fire_secret_scope honours. Without it the raise
+            # aborted the retry before the receipt was saved, the durable journal never closed,
+            # and every tick replayed 'Cron receipt recovery deferred' forever.
+            with _fire_secret_scope():
+                _save_compose_deliver(delivery, fence, answer, output, adapters=None, loop=None,
+                                      verbose=False, execution_token=None)
             fail_empty_response(delivery, answer)
             if finish_completed_run(delivery, None, params['request_id'], recovered=True):
                 _lift_pause(params['job_id'], record.get('pause_recorded'))
