@@ -11,8 +11,9 @@ supervisor (SIGUSR1 drain), and success is a fresh supervised PID — never the 
 from __future__ import annotations
 
 import sys
-import time
 from pathlib import Path
+
+from agent.deadline import poll_until
 
 # A custom KeepAlive supervisor keeps its own respawn interval (launchd's is ~once per 10s,
 # per LAUNCHD_SUPERVISION_VERIFY_TIMEOUT); 15s matches _wait_for_launchd_service_pid's budget.
@@ -34,18 +35,32 @@ def gateway_declares_external_supervisor(pid: int, home: Path | None = None) -> 
         return False
     from gateway.control_socket import identify_gateway, launch_supervisor
     from gateway.status import _get_process_hermes_home, read_runtime_status
-    from hermes_cli.gateway import _capture_gateway_argv
+    from hermes_cli.gateway import _capture_gateway_argv, _launchd_owns_gateway_pid
 
     home = home or _get_process_hermes_home()
     identity = identify_gateway(home) or {}
-    # Not ``identity["supervisor"]``: the runtime protocol reports a manual gateway as "none".
-    if identity.get("pid") == pid and launch_supervisor(identity) not in (None, "manual"):
+    supervisor = launch_supervisor(identity) if identity.get("pid") == pid else None
+    if identity.get("pid") == pid and supervisor not in (None, "manual"):
+        # A gateway SELF-declaring "launchd" still needs the pid-chain proof (t_4d8f6e29): the
+        # declaration reads env markers, and markers leak into desktop-session launches whose
+        # nominal job never spawned the process ("pending spawn, on-demand-only domain").
+        if supervisor == "launchd" and not _launchd_owns_gateway_pid(pid):
+            return False
         return True
     argv = _capture_gateway_argv(pid)
     if argv is None:
         record = read_runtime_status(home / "gateway_state.json") or {}
         argv = record.get("argv") if record.get("pid") == pid else None
-    return bool(argv) and "--external-supervisor" in argv
+    if not (bool(argv) and "--external-supervisor" in argv):
+        return False
+    # Route precedence (t_8eb8d661): the explicit --external-supervisor promise in the gateway's own
+    # argv outranks the launchd-ownership probe on every platform — the gateway trusts the same
+    # opt-in (which its startup stamps into HERMES_GATEWAY_EXTERNAL_SUPERVISOR) before any launchctl
+    # proof when it picks its own restart route, and reports that choice back to us over the control
+    # socket (restart_route). Probing here with the opposite order would arm a competing relaunch
+    # behind a hand-back the gateway has already committed to. Ambient launchd identity WITHOUT the
+    # explicit flag is still disproven above (self-declared supervisor == "launchd" path).
+    return True
 
 
 def _wait_for_supervised_gateway_replacement(
@@ -63,14 +78,11 @@ def _wait_for_supervised_gateway_replacement(
 
     if timeout is None:
         timeout = SUPERVISED_REPLACEMENT_VERIFY_TIMEOUT
-    deadline = time.monotonic() + max(timeout, 0.5)
-    while True:
+    def _fresh_pid() -> int | None:
         pid = get_running_pid()
-        if pid is not None and pid > 0 and pid != old_pid:
-            return pid
-        if time.monotonic() >= deadline:
-            return None
-        time.sleep(poll_interval)
+        return pid if pid is not None and pid > 0 and pid != old_pid else None
+
+    return poll_until(_fresh_pid, max(timeout, 0.5), poll_interval)
 
 
 def restart_externally_supervised_gateway(supervised_pid: int) -> None:
@@ -102,3 +114,50 @@ def restart_externally_supervised_gateway(supervised_pid: int) -> None:
         "  then rerun once it is healthy: hermes gateway restart",
     )
     sys.exit(1)
+
+
+def refuse_restart_of_service_managed_gateway(pid: int | None) -> None:
+    """Refuse the manual restart fallback when systemd owns the gateway under ANY unit name.
+
+    Canonical-unit checks miss pre-convention installs (``hermes.service``), so the fallback's
+    stop + in-process ``run_gateway`` SIGKILLed a live service-managed gateway and spawned an
+    unsupervised orphan in the caller's cgroup while the unit flapped against the stolen lock
+    (#126474). Reuses the dashboard's MainPID-verified lookup: a bare ``.service`` cgroup alone
+    (the caller itself started under some unit) never proves ownership.
+    """
+    if not pid or pid <= 1:
+        return
+    from hermes_cli import main_dashboard as _dash
+
+    owner = _dash._systemd_owner_for_pid(pid)
+    if owner is None:
+        return
+    unit, scope = owner
+    cmds = _dash._systemd_restart_commands(unit, scope)
+    from hermes_cli.gateway import _print_lines
+    _print_lines(
+        "",
+        f"✗ Gateway (PID {pid}) is managed by systemd unit {unit}.",
+        "  `hermes gateway restart` cannot restart it from here: the fallback would",
+        "  kill a live gateway and spawn an unsupervised replacement in this shell's",
+        "  cgroup while the unit keeps failing against the stolen lock.",
+        "  Restart it through its unit instead:",
+        *(f"    {c}" for c in cmds),
+        "  (Pre-convention `hermes.service` installs: `hermes gateway migrate-legacy`",
+        "  removes the legacy unit so the canonical one can own the gateway.)",
+    )
+    sys.exit(1)
+
+
+def start_restart_replacement(args, *, force: bool) -> None:
+    """Start the manual fallback's replacement once the old owner is gone.
+
+    ``--detach`` (Desktop's bounded, piped client; the updater's recovery call) starts it the way
+    ``gateway ensure`` starts an absent owner. In the foreground that caller became the long-lived
+    gateway it only meant to restart: a child its own timeout killed, holding the app's quit open.
+    """
+    from hermes_cli import gateway as gw
+    if getattr(args, "detach", False):
+        from hermes_cli.gateway_runtime_start import start_detached_replacement
+        sys.exit(start_detached_replacement(gw.get_hermes_home(), force=force))
+    gw.run_gateway(verbose=0, force=force)

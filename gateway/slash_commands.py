@@ -139,6 +139,7 @@ def _spawn_detached_update(hermes_cmd, output_path, exit_code_path) -> None:
         subprocess.Popen(
             [sys.executable, "-c", _WINDOWS_UPDATE_HELPER, str(output_path), str(exit_code_path),
              sys.executable, "-m", "hermes_cli.main", "update", "--gateway"],
+            # detached-spawn: ok — /update runs `hermes update`, which must outlive the gateway it restarts
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **windows_detach_popen_kwargs())
         return
     hermes_cmd_str = " ".join(shlex.quote(part) for part in hermes_cmd)
@@ -154,6 +155,7 @@ def _spawn_detached_update(hermes_cmd, output_path, exit_code_path) -> None:
     # calls os.setsid() in the child.
     setsid_bin = shutil.which("setsid")
     argv = [setsid_bin, "bash", "-c", update_cmd] if setsid_bin else ["bash", "-c", update_cmd]
+    # detached-spawn: ok — /update runs `hermes update`, which must outlive the gateway it restarts
     subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
 
 
@@ -440,13 +442,16 @@ class GatewaySlashCommandsMixin(
             await self._interrupt_and_clear_session(
                 key, source, interrupt_reason=_INTERRUPT_REASON_STOP,
                 invalidation_reason=invalidation_reason)
-        agent = self._running_agents.get(session_key)
+        # A turn the app started while the chat was elsewhere still runs on its own key (/resume).
+        from gateway.session_detached import chat_running_key
+        run_key = chat_running_key(self, session_key, session_entry)
+        agent = self._running_agents.get(run_key)
         if agent is _AGENT_PENDING_SENTINEL:  # force-clean the sentinel so the session is unlocked
-            await _stop(session_key, "stop_command_pending")
-            logger.info("STOP (pending) for session %s — sentinel cleared", session_key)
+            await _stop(run_key, "stop_command_pending")
+            logger.info("STOP (pending) for session %s — sentinel cleared", run_key)
             return EphemeralReply(t("gateway.stop.stopped_pending"))
         if agent:  # force-clean the session lock so a truly hung agent doesn't keep it forever
-            await _stop(session_key, "stop_command_handler")
+            await _stop(run_key, "stop_command_handler")
             return EphemeralReply(t("gateway.stop.stopped"))
 
         # No run under the caller's own key: a live turn in THIS chat may still carry a differently
@@ -585,8 +590,22 @@ class GatewaySlashCommandsMixin(
         # Under a service manager (systemd/launchd) or Docker/Podman, exit 75 so the supervisor /
         # restart policy restarts us — detached setsid+bash fails there (systemd KillMode=mixed kills
         # the cgroup; tini exits with the gateway). The explicit marker covers ``sudo env -i`` wrappers.
-        from gateway.restart import is_container_restart_context, is_gateway_supervisor_process
-        via_service = is_gateway_supervisor_process() or is_container_restart_context()
+        # Trust vs ownership (t_4d8f6e29): env markers answer existence, not ownership — a launchd
+        # job that never spawned this process will not relaunch an exit 75. Verify the pid chain
+        # before choosing the hand-back; fall back to the detached self-relaunch otherwise.
+        from gateway.restart import (
+            GATEWAY_SERVICE_RESTART_EXIT_CODE, is_container_restart_context,
+            is_gateway_supervisor_process, service_restart_route_trusted,
+        )
+        via_service, route_reason = service_restart_route_trusted()
+        if not via_service and is_container_restart_context():
+            via_service, route_reason = True, "container restart policy"
+        if not via_service and is_gateway_supervisor_process():
+            logger.error(
+                "/restart: supervisor marker present but no manager OWNS this process (%s) — "
+                "refusing exit-%d hand-back and using the detached self-relaunch path instead.",
+                route_reason, GATEWAY_SERVICE_RESTART_EXIT_CODE,
+            )
         self.request_restart(detached=not via_service, via_service=via_service)
         # Track sessions that were active at shutdown for stuck-loop detection (#7536). On each restart, the
         # counter increments for sessions that were running. If a session hits the threshold (3 consecutive

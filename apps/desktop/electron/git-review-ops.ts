@@ -8,6 +8,7 @@ import { execFile } from 'node:child_process'
 import fs from 'node:fs/promises'
 import path from 'node:path'
 
+import { isGitEnvKey } from '@simple-git/argv-parser'
 import { simpleGit } from 'simple-git'
 
 import { resolveRequestedPathForIpc } from './hardening'
@@ -19,16 +20,52 @@ const REVIEW_FILE_CAP = 2_000
 const UNTRACKED_LINE_COUNT_CONCURRENCY = 16
 const UNTRACKED_LINE_COUNT_MAX_BYTES = 1024 * 1024
 
-// simple-git validates a custom binary path against an ASCII whitelist — the
-// binary plugin in node_modules/simple-git/dist/index.cjs accepts only
-// `/^([a-z]:)?([a-z0-9/.\_~-]+)$/i`. Everything outside it is "restricted": a
+// simple-git validates a custom binary path against an ASCII whitelist
+// (`/^([a-z]:)?([a-z0-9/.\_~-]+)$/i`). Everything outside it is "restricted": a
 // space in the default `C:\Program Files\Git\...`, the parentheses in
 // `Program Files (x86)`, the accented user name in `C:\Users\João\...`. Without
-// the escape hatch simple-git THROWS with this exact message; with it, v4 is
-// silent (v3 console.warned it on every factory call). Exported so gitFor
-// and its tests share one source of truth.
-export const SIMPLE_GIT_UNSAFE_BINARY_WARN =
-  'Invalid value supplied for custom binary, restricted characters must be removed or supply the unsafe.allowUnsafeCustomBinary option'
+// `unsafe.allowUnsafeCustomBinary` simple-git THROWS on such a path.
+
+// simple-git 4 strips every guarded variable (any `GIT_*`, plus EDITOR, VISUAL,
+// PAGER, PREFIX, SSH_ASKPASS) from the environment git runs with, and rejects
+// the task when one is passed explicitly through `.env()`. These are the ones
+// the Review pane keeps forwarding from the user's own environment: the SSH
+// transport and askpass helpers `git push` authenticates with, and
+// GIT_TERMINAL_PROMPT, which stops a credential prompt from blocking a git
+// process that has no terminal.
+export const SIMPLE_GIT_ALLOWED_ENV = ['GIT_SSH_COMMAND', 'GIT_SSH', 'GIT_ASKPASS', 'SSH_ASKPASS', 'GIT_TERMINAL_PROMPT']
+
+// simple-git's vulnerability check additionally rejects GIT_SSH/GIT_SSH_COMMAND
+// and GIT_ASKPASS/SSH_ASKPASS in an explicit `.env()` (the Windows host path
+// below) unless these categories are enabled. The values come from the user's
+// environment, never from the renderer.
+const SIMPLE_GIT_ALLOWED_ENV_UNSAFE = { allowUnsafeAskPass: true, allowUnsafeSshCommand: true }
+
+const ALLOWED_ENV_KEYS = new Set(SIMPLE_GIT_ALLOWED_ENV.map(key => key.toLowerCase()))
+
+// Same test simple-git's environment guard applies, so the explicit env never
+// carries a key the guard would reject.
+function isGuardedGitEnvKey(key: string): boolean {
+  const lower = key.toLowerCase().trim()
+
+  return lower.startsWith('git_') || isGitEnvKey(lower)
+}
+
+// Explicit env for the Windows no-console host tuple: the host script needs
+// HERMES_GIT_ARGV0, and simple-git replaces the inherited env with whatever
+// `.env()` receives, so the rest of the environment is forwarded minus the
+// guarded keys that are not allow-listed.
+export function simpleGitHostEnv(base: NodeJS.ProcessEnv | undefined, gitBin: string): NodeJS.ProcessEnv {
+  const env = noConsoleGitEnv(base, gitBin)
+
+  for (const key of Object.keys(env)) {
+    if (isGuardedGitEnvKey(key) && !ALLOWED_ENV_KEYS.has(key.toLowerCase().trim())) {
+      delete env[key]
+    }
+  }
+
+  return env
+}
 
 // GUI-launched Electron apps on macOS inherit only a minimal PATH (no
 // /opt/homebrew/bin or /usr/local/bin), so `gh` — and the `git` gh shells out
@@ -74,29 +111,18 @@ function gitFor(cwd, gitBin) {
   // forwards argv unchanged.
   const host = windowsGitHost()
   const binary = simpleGitBinary(gitBin, host)
-  const unsafe = Boolean(gitBin) || Array.isArray(binary)
+  const unsafeBinary = Boolean(gitBin) || Array.isArray(binary)
 
-  const makeGit = () =>
-    simpleGit({
-      baseDir: cwd,
-      binary,
-      maxConcurrentProcesses: 4,
-      trimmed: false,
-      ...(unsafe ? { unsafe: { allowUnsafeCustomBinary: true } } : {})
-    })
+  const git = simpleGit({
+    allowEnvironment: SIMPLE_GIT_ALLOWED_ENV,
+    baseDir: cwd,
+    binary,
+    maxConcurrentProcesses: 4,
+    trimmed: false,
+    unsafe: { ...SIMPLE_GIT_ALLOWED_ENV_UNSAFE, ...(unsafeBinary ? { allowUnsafeCustomBinary: true } : {}) }
+  })
 
-  if (!unsafe) {
-    return makeGit()
-  }
-
-  // v4 is silent once the hatch is set — the filter that used to wrap this call
-  // suppressed a v3 console.warn that no longer exists. The hatch itself is
-  // still required: without it the factory throws
-  // SIMPLE_GIT_UNSAFE_BINARY_WARN, pinned in git-review-ops.test.ts so an
-  // upgrade that rewords or drops the guard fails the test, not production.
-  const git = makeGit()
-
-  return Array.isArray(binary) ? git.env(noConsoleGitEnv(process.env, gitBin || 'git')) : git
+  return Array.isArray(binary) ? git.env(simpleGitHostEnv(process.env, gitBin || 'git')) : git
 }
 
 // simple-git reports renames as `old => new` (and `dir/{old => new}/f`); resolve

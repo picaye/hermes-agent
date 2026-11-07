@@ -31,6 +31,7 @@ from typing import Any, Iterable, Optional
 
 from hermes_cli.kanban_workflow import DEFAULT_STATUSES as VALID_STATUSES
 from toolsets import get_toolset_names
+from utils import unlink_files_older_than
 
 _log = logging.getLogger(__name__)
 
@@ -322,26 +323,6 @@ def _resolve_crash_grace_seconds() -> int:
 def _resolve_rate_limit_cooldown_seconds() -> int:
     """``HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS`` (0 = next tick, for tests) else default."""
     return _env_int("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS)
-
-
-def _relative_age(ts: Optional[int], now: Optional[int] = None) -> str:
-    """``just now`` / ``18h ago`` / ``3d ago``; "" for a missing/invalid ts. An LLM
-    reads a bare absolute timestamp as current fact — the relative age is what
-    prompts a worker to re-verify stale sibling work."""
-    try:
-        ts = int(ts)
-    except (TypeError, ValueError):
-        return ""
-    if now is None:
-        now = int(time.time())
-    delta = now - ts
-    if delta < 60:  # includes negative = clock skew across machines; never claim "in the future"
-        return "just now"
-    if delta < 3600:
-        return f"{delta // 60}m ago"
-    if delta < 86400:
-        return f"{delta // 3600}h ago"
-    return f"{delta // 86400}d ago"
 
 
 # --- Paths ---
@@ -990,6 +971,28 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
+-- Durable audit trail for hard deletes (t_327e01b8). ``archive --rm`` and
+-- the dashboard DELETE route purge a task row AND every related row —
+-- including its task_events — via _delete_task_relations(), so a purged
+-- card was 100% invisible to board-history queries and sweep
+-- dedupe/exemption baselines. One row is appended per successful delete,
+-- INSIDE the delete transaction and BEFORE the purge, capturing a final
+-- snapshot of the card. Rows are keyed by the deleted task id and are
+-- DELIBERATELY not purged by _delete_task_relations() — they must
+-- outlive the task they describe.
+CREATE TABLE IF NOT EXISTS task_deletions (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id      TEXT NOT NULL,
+    title        TEXT,
+    status       TEXT,
+    assignee     TEXT,
+    tenant       TEXT,
+    deleted_at   INTEGER NOT NULL,
+    deleted_by   TEXT,
+    source       TEXT,
+    snapshot     TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
 CREATE INDEX IF NOT EXISTS idx_links_parent          ON task_links(parent_id);
@@ -999,6 +1002,7 @@ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, start
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+CREATE INDEX IF NOT EXISTS idx_deletions_task        ON task_deletions(task_id, deleted_at);
 """
 
 
@@ -2372,9 +2376,9 @@ def release_stale_claims(
         "WHERE status = 'running' AND claim_expires IS NOT NULL "
         "  AND claim_expires < ?", (now,),
     ).fetchall()
-    from hermes_cli.kanban_owner_recovery import owner_reclaim_paused
+    from hermes_cli.kanban_owner_recovery import owner_reclaim_blocked, owner_reclaim_blocked_after_kill, reclaim_error
     for row in stale:
-        if owner_reclaim_paused(conn, row["id"]):
+        if owner_reclaim_blocked(conn, row["id"]):
             continue
         host_local = (row["claim_lock"] or "").startswith(host_prefix)
         hb = _to_epoch(row["last_heartbeat_at"])
@@ -2398,7 +2402,11 @@ def release_stale_claims(
             )
             continue
         with write_txn(conn):
-            retry_status = _retry_status_for_run(conn, row["id"])
+            # Again under the write lock: an interpreter that bound since the check above
+            # changes neither claim_lock nor worker_pid, so the CAS below cannot see it.
+            if owner_reclaim_blocked_after_kill(conn, row["id"], signalled=bool(termination.get("termination_attempted"))):
+                continue
+            retry_status, error = _retry_status_for_run(conn, row["id"]), reclaim_error(conn, row["id"], row["claim_lock"])
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL "
@@ -2412,7 +2420,7 @@ def release_stale_claims(
                 continue
             run_id = _record_reclaim(
                 conn, row["id"], termination,
-                error=f"stale_lock={row['claim_lock']}",
+                error=error,
                 payload={
                     "stale_lock": row["claim_lock"],
                     "worker_pid": _opt_int(row["worker_pid"]),
@@ -2429,7 +2437,7 @@ def release_stale_claims(
         # the run ended without a verdict, so it counts toward the breaker and a
         # trip flips the task to ``blocked`` + ``gave_up`` on top of ``reclaimed``.
         _record_task_failure(
-            conn, row["id"], f"stale_lock={row['claim_lock']}",
+            conn, row["id"], error,
             outcome="reclaimed", failure_limit=failure_limit,
             release_claim=False, end_run=False,
             event_payload_extra={"worker_pid": _opt_int(row["worker_pid"]), "retry_status": retry_status},
@@ -3223,10 +3231,6 @@ def block_task(
         )
         _append_event(conn, task_id, event_kind, payload, run_id=run_id)
         blocked_task = get_task(conn, task_id)
-        if kind == "dependency":
-            # Historical ordering: the dependency lane fires inside the txn.
-            _fire_task_hook("kanban_task_blocked", blocked_task, task_id, run_id, reason=reason)
-            return True
     _fire_task_hook("kanban_task_blocked", blocked_task, task_id, run_id, reason=reason)
     return True
 
@@ -3853,29 +3857,121 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
 
 
 def _delete_task_relations(conn: sqlite3.Connection, task_id: str) -> None:
-    """Delete every row referencing ``task_id`` (schema has no ON DELETE CASCADE)."""
+    """Delete every row referencing ``task_id`` (schema has no ON DELETE CASCADE).
+
+    ``task_deletions`` is deliberately NOT listed here: its rows must
+    outlive the task they describe (audit trail for the purge, t_327e01b8).
+    """
     conn.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (task_id, task_id))
     for table in ("task_comments", "task_events", "task_runs", "kanban_notify_subs"):
         conn.execute(f"DELETE FROM {table} WHERE task_id = ?", (task_id,))
 
 
-def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
+def _append_deletion_audit(
+    conn: sqlite3.Connection,
+    task_row: sqlite3.Row,
+    *,
+    actor: Optional[str] = None,
+    source: Optional[str] = None,
+) -> None:
+    """Append the durable audit record for one hard delete, inside the
+    caller's delete transaction and BEFORE :func:`_delete_task_relations`
+    purges the task's events/comments/runs.
+
+    ``task_row`` is the full ``tasks`` row captured while the task still
+    exists. The card stays queryable afterwards via
+    :func:`list_deletions` — board history and sweep dedupe/exemption
+    baselines no longer go blind on purge (t_327e01b8).
+    """
+    task_id = task_row["id"]
+    conn.execute(
+        "INSERT INTO task_deletions "
+        "(task_id, title, status, assignee, tenant, deleted_at, deleted_by, source, snapshot) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            task_id,
+            task_row["title"],
+            task_row["status"],
+            task_row["assignee"],
+            task_row["tenant"],
+            int(time.time()),
+            actor,
+            source,
+            _json_or_null({k: task_row[k] for k in task_row.keys()}),
+        ),
+    )
+
+
+def get_deletion(conn: sqlite3.Connection, task_id: str) -> Optional[dict]:
+    """Most recent deletion audit row for ``task_id``, or ``None`` if the
+    task was never purged. Survives ``_delete_task_relations`` by design."""
+    row = conn.execute(
+        "SELECT * FROM task_deletions WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def list_deletions(
+    conn: sqlite3.Connection,
+    *,
+    since: Optional[int] = None,
+    limit: Optional[int] = None,
+) -> list[dict]:
+    """Deletion audit rows (oldest first), optionally filtered to
+    ``deleted_at >= since`` — the queryable board-history surface for
+    purged cards."""
+    q = "SELECT * FROM task_deletions"
+    args: list = []
+    if since is not None:
+        q += " WHERE deleted_at >= ?"
+        args.append(since)
+    q += " ORDER BY id ASC"
+    if limit is not None:
+        q += " LIMIT ?"
+        args.append(int(limit))
+    return [dict(r) for r in conn.execute(q, args).fetchall()]
+
+
+def delete_archived_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    actor: Optional[str] = None,
+    source: Optional[str] = None,
+) -> bool:
     """Hard-delete an ARCHIVED task (+ related rows); anything else must be
-    archived first so data loss takes two deliberate actions."""
+    archived first so data loss takes two deliberate actions. A durable
+    ``task_deletions`` audit row is appended before the purge."""
     with write_txn(conn):
-        if _task_status(conn, task_id) != "archived":
+        row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if row is None or row["status"] != "archived":
             return False
+        _append_deletion_audit(conn, row, actor=actor, source=source)
         _delete_task_relations(conn, task_id)
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         return cur.rowcount == 1
 
 
-def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Hard-delete a task and its related rows in one txn; False when not found."""
+def delete_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    actor: Optional[str] = None,
+    source: Optional[str] = None,
+) -> bool:
+    """Hard-delete a task and its related rows in one txn; False when not found.
+    A durable ``task_deletions`` audit row is appended before the purge."""
     with write_txn(conn):
-        cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
-        if cur.rowcount != 1:
+        row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if row is None:
             return False
+        # BEGIN IMMEDIATE serializes writers, so between the SELECT above and
+        # this DELETE no concurrent commit can remove the row: rowcount == 1.
+        conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+        # Audit BEFORE the relations purge: the record must outlive the rows
+        # _delete_task_relations() removes (t_327e01b8).
+        _append_deletion_audit(conn, row, actor=actor, source=source)
         _delete_task_relations(conn, task_id)
     recompute_ready(conn)
     return True
@@ -4054,14 +4150,7 @@ def gc_worker_logs(*, older_than_seconds: int = 30 * 24 * 3600, board: Optional[
     log_dir = worker_logs_dir(board=board)
     if not log_dir.exists():
         return 0
-    cutoff = time.time() - older_than_seconds
-    removed = 0
-    for p in log_dir.iterdir():
-        with contextlib.suppress(OSError):
-            if p.is_file() and p.stat().st_mtime < cutoff:
-                p.unlink()
-                removed += 1
-    return removed
+    return unlink_files_older_than(log_dir, "*", older_than_seconds)
 
 
 # --- Worker log accessor ---
@@ -4113,7 +4202,7 @@ def list_profiles_on_disk() -> list[str]:
         names.add("default")
     if profiles_dir.is_dir():
         try:
-            names.update(e.name for e in profiles_dir.iterdir() if e.is_dir() and (e / "config.yaml").is_file())
+            names.update(e.name for e in profiles_dir.iterdir() if e.is_dir() and (e / "config.yaml").is_file())  # config-reader: ok — profile directory discovery marker
         except OSError:
             pass
     return sorted(names)
