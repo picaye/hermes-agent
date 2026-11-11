@@ -35,18 +35,32 @@ def gateway_declares_external_supervisor(pid: int, home: Path | None = None) -> 
         return False
     from gateway.control_socket import identify_gateway, launch_supervisor
     from gateway.status import _get_process_hermes_home, read_runtime_status
-    from hermes_cli.gateway import _capture_gateway_argv
+    from hermes_cli.gateway import _capture_gateway_argv, _launchd_owns_gateway_pid
 
     home = home or _get_process_hermes_home()
     identity = identify_gateway(home) or {}
-    # Not ``identity["supervisor"]``: the runtime protocol reports a manual gateway as "none".
-    if identity.get("pid") == pid and launch_supervisor(identity) not in (None, "manual"):
+    supervisor = launch_supervisor(identity) if identity.get("pid") == pid else None
+    if identity.get("pid") == pid and supervisor not in (None, "manual"):
+        # A gateway SELF-declaring "launchd" still needs the pid-chain proof (t_4d8f6e29): the
+        # declaration reads env markers, and markers leak into desktop-session launches whose
+        # nominal job never spawned the process ("pending spawn, on-demand-only domain").
+        if supervisor == "launchd" and not _launchd_owns_gateway_pid(pid):
+            return False
         return True
     argv = _capture_gateway_argv(pid)
     if argv is None:
         record = read_runtime_status(home / "gateway_state.json") or {}
         argv = record.get("argv") if record.get("pid") == pid else None
-    return bool(argv) and "--external-supervisor" in argv
+    if not (bool(argv) and "--external-supervisor" in argv):
+        return False
+    # Route precedence (t_8eb8d661): the explicit --external-supervisor promise in the gateway's own
+    # argv outranks the launchd-ownership probe on every platform — the gateway trusts the same
+    # opt-in (which its startup stamps into HERMES_GATEWAY_EXTERNAL_SUPERVISOR) before any launchctl
+    # proof when it picks its own restart route, and reports that choice back to us over the control
+    # socket (restart_route). Probing here with the opposite order would arm a competing relaunch
+    # behind a hand-back the gateway has already committed to. Ambient launchd identity WITHOUT the
+    # explicit flag is still disproven above (self-declared supervisor == "launchd" path).
+    return True
 
 
 def _wait_for_supervised_gateway_replacement(

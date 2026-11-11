@@ -54,6 +54,16 @@ class _AbortedStartupRunner:
 @pytest.mark.asyncio
 async def test_sigusr1_handler_installed_by_start_gateway_logs_graceful_restart(tmp_path, monkeypatch, caplog):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    # Hermetic signal-handler route pin (t_8eb8d661): the SIGUSR1 handler now consults
+    # gateway.restart.service_restart_route_trusted(), which reads this process's live environment.
+    # On hosts whose session carries launchd-shaped markers (macOS Aqua sessions stamp
+    # XPC_SERVICE_NAME on everything) the seam disproves ownership for a test child and flips the
+    # call to the detached fallback. Clear the ambient markers and pin an unconditionally trusted
+    # per-launch one so the assertion stands on every platform.
+    for var in ("XPC_SERVICE_NAME", "HERMES_LAUNCHD_LABEL", "HERMES_S6_SUPERVISED_CHILD",
+                "HERMES_GATEWAY_EXTERNAL_SUPERVISOR", "HERMES_SUPERVISED_CHILD"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("INVOCATION_ID", "sigusr1-graceful-restart-test")
     for target, value in (
         ("gateway.status.get_running_pid", lambda: None),
         ("gateway.status.acquire_gateway_runtime_lock", lambda: True),

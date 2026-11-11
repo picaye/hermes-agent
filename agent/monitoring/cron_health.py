@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 # ``cancelled``: an operator stopped the run; ``missed``: the scheduler skipped past its slots.
 _KNOWN_STATUSES = {"claimed", "running", "completed", "failed", "unknown", "cancelled", "missed"}
 _KNOWN_SOURCES = {"builtin", "direct", "external"}
-_KNOWN_DELIVERY_OUTCOMES = {"queued", "delivered", "failed", "suppressed", "suppressed_acked", "not_configured"}
+_KNOWN_DELIVERY_OUTCOMES = {"queued", "delivered", "failed", "suppressed", "suppressed_acked", "not_configured", "self_removed"}
 _TERMINAL_STATUSES = {"completed", "failed", "unknown", "cancelled", "missed"}
 
 
