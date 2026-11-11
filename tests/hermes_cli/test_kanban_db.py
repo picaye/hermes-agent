@@ -504,6 +504,44 @@ def test_respawn_guard_blocker_auth_curated_not_open_stem(
         assert kbd.check_respawn_guard(conn, tid) == expected
 
 
+def test_respawn_guard_blocker_auth_releases_when_blockers_close(kanban_home, monkeypatch):
+    """Blocker-class suppression is re-evaluated against CURRENT blocker state,
+    not against the world as it was when the stamp was written.
+
+    The freeze this fixes: a card's stamped 401 emitted ``blocker_auth`` every
+    tick forever although its only blocker card was done — the stamp is cleared
+    only by a successful ``complete_task``, and the guard is what prevented the
+    completion. Release is state-driven (analogous to ``active_pr``'s 24h text
+    expiry but keyed to the ``task_links`` model): suppressed while a blocker
+    is open, released the same tick the last blocker goes done/archived, and
+    re-armed if that blocker regresses. A stamped failure with NO blocker links
+    keeps suppressing — zero links is not proof the waited-on condition closed.
+    """
+    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "0")
+
+    with kbc.connect() as conn:
+        blocker = kb.create_task(conn, title="fix qa creds", assignee="ops")
+        tid = kb.create_task(conn, title="auth-trapped lane", assignee="qa")
+        kb.link_tasks(conn, blocker, tid)
+        conn.execute(
+            "UPDATE tasks SET last_failure_error=? WHERE id=?",
+            ("PR acceptance auth: GitHub refused the acceptance read (HTTP 401)", tid),
+        )
+        conn.commit()
+
+        # Blocker still open -> suppression holds (the guard's original purpose).
+        assert kbd.check_respawn_guard(conn, tid) == "blocker_auth"
+
+        # Blocker done -> released immediately; no clock to wait out.
+        kb.complete_task(conn, blocker, result="creds fixed, verified live")
+        assert kbd.check_respawn_guard(conn, tid) is None
+
+        # Blocker regresses -> suppression re-arms (state-driven both ways).
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (blocker,))
+        conn.commit()
+        assert kbd.check_respawn_guard(conn, tid) == "blocker_auth"
+
+
 def test_respawn_guard_ignores_auth_words_in_crashed_worker_output(kanban_home):
     """A plain crash's captured stdout is context, not a diagnosis.
 
@@ -562,6 +600,16 @@ def test_infrastructure_spawn_refusal_never_charges_the_card(
     failure on the same card still counts."""
     from tools import process_registry
 
+    # Environment assumption made explicit: the real boundary is reached
+    # through an OS gate (`if not _IS_LINUX:` in
+    # restart_safe_gateway_child_argv) that short-circuits to "in_process"
+    # before any of the probes below are consulted. The scenario this test
+    # models — a systemd-managed Linux gateway refusing to place a worker — only
+    # exists on Linux, so pin the gate exactly like the other environment
+    # probes. Without this the test is host-dependent: on macOS/Windows the
+    # boundary never refuses, the spawn falls into the ordinary-failure path,
+    # and the breaker charges the card.
+    monkeypatch.setattr(process_registry, "_IS_LINUX", True)
     monkeypatch.setattr(process_registry, "_is_supervised_gateway_process", lambda: True)
     monkeypatch.setenv("INVOCATION_ID", "managed-gateway")
     monkeypatch.setattr(process_registry, "_systemd_run_user_scope_available", lambda: False)

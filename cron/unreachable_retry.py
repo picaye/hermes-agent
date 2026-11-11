@@ -5,8 +5,10 @@ Inspired by Claude Cowork (desktop changelog v1.46388.1, 2026-09-04): "automatic
 for example right after the computer wakes behind a VPN."
 
 The class is deliberately narrow: the run must have FAILED with a transient network /
-DNS error (``cron.scheduler_preflight._is_transient_provider_resolve_error``) AND the
-agent must have completed zero API calls. Nothing was executed and nothing was spent, so
+DNS error (``cron.scheduler_preflight._is_transient_provider_resolve_error``) OR a
+provider-side 503-class abort (engine exited before ready, stale circuit-breaker abort;
+see ``_is_provider_side_abort``) AND the agent must have completed zero API calls.
+Nothing was executed and nothing was spent, so
 re-running cannot double a side effect — unlike a generic failure retry (see PR #16512),
 which has to answer for one-shot dispatch accounting and mid-run side effects. Recurring
 jobs only: finite one-shots are pre-claimed by ``claim_dispatch`` (at-most-times, #38758)
@@ -55,14 +57,45 @@ def retry_enabled(cfg: Optional[dict] = None) -> bool:
     return cron_cfg.get("retry_unreachable") is not False
 
 
+# Provider-side aborts: the endpoint itself refused or gave up before producing any
+# streamed response — e.g. a serving stack whose engine process exited before it was
+# ready (HTTP 502/503/504) or whose stale circuit breaker aborted the call after N
+# consecutive unresponsive attempts. Like a DNS blip, these mean the model was never
+# reached, so a zero-API-call run is safe to re-fire on the ladder. Matched on the
+# wrapped error text the scheduler raises (``format_runtime_provider_error``), walking
+# the cause chain. Deliberately keyed on abort phrasing + 502/503/504 status text, NOT
+# on 500 (a 500 can follow real work) and NOT on auth/4xx (deterministic; retry won't
+# help).
+_PROVIDER_ABORT_NEEDLES = (
+    "engine exited before",
+    "consecutive stale attempts",
+    "http 502", "http 503", "http 504",
+)
+
+
+def _is_provider_side_abort(exc: BaseException) -> bool:
+    seen: set[int] = set()
+    cur: Optional[BaseException] = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        msg = str(cur).lower()
+        if any(needle in msg for needle in _PROVIDER_ABORT_NEEDLES):
+            return True
+        cur = cur.__cause__ or cur.__context__
+    return False
+
+
 def is_model_unreachable_failure(exc: BaseException, agent: Any = None) -> bool:
-    """True when *exc* is a transient network/DNS failure and *agent* (may be ``None``)
-    never completed a model call — the run consumed nothing and executed nothing."""
+    """True when *exc* is a transient network/DNS failure or a provider-side 503-class
+    abort and *agent* (may be ``None``) never completed a model call — the run consumed
+    nothing and executed nothing."""
     if int(getattr(agent, "session_api_calls", 0) or 0) > 0:
         return False
     from cron.scheduler_preflight import _is_transient_provider_resolve_error
 
-    return _is_transient_provider_resolve_error(exc)
+    if _is_transient_provider_resolve_error(exc):
+        return True
+    return _is_provider_side_abort(exc)
 
 
 def _ladder_applies(job: dict[str, Any]) -> bool:
@@ -99,7 +132,8 @@ def will_retry(job: dict[str, Any]) -> bool:
     from cron.jobs import _parse_aware, compute_next_run
 
     now = _hermes_now()
-    natural_next = _parse_aware(compute_next_run(job.get("schedule") or {}, now.isoformat()))
+    natural_next = _parse_aware(compute_next_run(
+        job.get("schedule") or {}, now.isoformat(), timezone=job.get("timezone")))
     if natural_next is None:
         # The natural occurrence is uncomputable (e.g. croniter missing): _advance_after_run
         # leaves the record state=error — terminal — so plan_retry never runs either.

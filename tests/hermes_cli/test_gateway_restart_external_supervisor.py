@@ -43,6 +43,8 @@ def restart_calls(monkeypatch):
     monkeypatch.setattr(gw, "_get_restart_exit_wait_budget", lambda: 7.0)
     monkeypatch.setattr(gateway_status, "get_running_pid", _running_pid)
     monkeypatch.setattr(gw, "_capture_gateway_argv", lambda pid: SUPERVISED_ARGV if pid == 4321 else None)
+    # Hermetic on darwin runners (t_4d8f6e29 added a launchd pid-chain probe to the claim path).
+    monkeypatch.setattr(gw, "_launchd_owns_gateway_pid", lambda pid: True)
     monkeypatch.setattr("gateway.control_socket.identify_gateway", lambda home, **k: None)
     monkeypatch.setattr(supervised, "SUPERVISED_REPLACEMENT_VERIFY_TIMEOUT", 0.5)
     monkeypatch.setattr(gw, "_graceful_restart_via_sigusr1", _sigusr1)

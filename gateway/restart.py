@@ -277,6 +277,144 @@ def is_container_restart_context() -> bool:
     return os.path.exists("/.dockerenv") or os.path.exists("/run/.containerenv")
 
 
+# Trust vs ownership (t_4d8f6e29): ``is_gateway_supervisor_process`` answers "does this process
+# CARRY a supervisor marker" — existence of the marker, not proof that the manager OWNS this
+# process. On macOS both marker sources leak: an Aqua session stamps a non-"0" XPC_SERVICE_NAME on
+# everything it spawns (so the launchd wrapper stamps ``--external-supervisor`` onto argv, see
+# ``hermes_cli.stderr_timestamp._prepare_child_command``), and a job whose domain is on-demand-only
+# answers ``launchctl print`` with its definition while never spawning a process ("pending spawn").
+# A gateway that exits 75 under those markers is stranded: nobody is obligated to relaunch it
+# (observed: fleet dead ~2h25m, 13:04-15:28, root-caused in t_946dd633). Every exit-75 hand-back
+# decision must therefore prove the job's live PID is this process or one of its ancestors.
+# The systemd ``INVOCATION_ID`` and s6 sentinels stay env-only trusted: they are minted for the
+# very invocation that exec'd this tree; the explicit ``--external-supervisor`` env opt-in is an
+# operator promise.
+
+_LAUNCHD_JOB_PID_RE = re.compile(r'^\s*(?:"?PID"?|pid)\s*=\s*(\d+)\s*;?\s*$')
+
+
+def parse_launchd_job_pid(output: object) -> int | None:
+    """Live PID of a launchd job from ``launchctl list <label>``/``launchctl print`` output.
+
+    ``launchctl list <label>`` prints ``"PID" = <n>;`` only while a process runs; a registered but
+    never-spawned job (the on-demand-domain shape) answers without a PID line. ``launchctl print``
+    uses ``pid = <n>``. None means "launchd runs no process for this label"."""
+    for line in str(output or "").splitlines():
+        match = _LAUNCHD_JOB_PID_RE.match(line.strip())
+        if match:
+            try:
+                pid = int(match.group(1))
+            except ValueError:
+                continue
+            return pid if pid > 1 else None
+    return None
+
+
+def launchd_running_job_pid(
+    label: str,
+    *,
+    run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> int | None:
+    """The PID launchd currently runs for ``label``, or None (not running, query failed).
+
+    ``launchctl list <label>`` is domain-agnostic on purpose: ``launchctl print`` domain probes
+    fail on macOS-26 per-user domains (mirrors ``hermes_cli.gateway_launchd._launchctl_supervised_pid``).
+    None is the fail-CLOSED answer for the restart route — "launchd cannot promise a relaunch" —
+    unlike :func:`read_launchd_exit_timeout_s`' fail-open drain sizing, where a longer drain is
+    only a slower stop.
+    """
+    try:
+        proc = run(
+            ["launchctl", "list", label],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return parse_launchd_job_pid(proc.stdout)
+
+
+def process_ancestor_pids(pid: int) -> list[int]:
+    """Ancestry of ``pid`` (parent, grandparent, ...); empty when unreadable.
+
+    The generated plist runs the stderr-timestamp wrapper as the job process and the gateway below
+    it, so launchd ownership is an ancestry test, not equality.
+    """
+    try:
+        import psutil  # type: ignore
+    except ImportError:
+        return []
+    pids: list[int] = []
+    try:
+        proc = psutil.Process(pid)
+        while True:
+            parent = proc.parent()
+            if parent is None or parent.pid <= 1:
+                break
+            pids.append(parent.pid)
+            proc = parent
+    except Exception:  # health: allow BLE001 — unreadable tree proves nothing; callers fail closed
+        return pids
+    return pids
+
+
+def service_restart_route_trusted(
+    environ: Mapping[str, str] | None = None,
+    *,
+    pid: int | None = None,
+    job_pid_fn: Callable[[str], int | None] | None = None,
+    ancestors_fn: Callable[[int], list[int]] | None = None,
+) -> tuple[bool, str]:
+    """May this process choose the exit-75 "hand back to the manager" route and expect a relaunch?
+
+    ``(trusted, reason)`` — ``reason`` belongs in the caller's log line. Per-launch markers
+    (systemd ``INVOCATION_ID``, s6 sentinel, explicit ``HERMES_GATEWAY_SUPERVISOR``-style env
+    opt-in) are trusted outright; a launchd identity claim (ai.hermes ``XPC_SERVICE_NAME`` or the
+    wrapper-forwarded ``HERMES_LAUNCHD_LABEL``) additionally requires the pid-chain ownership proof:
+    the PID ``launchctl`` reports as the job's must be this process or one of its ancestors. A bare
+    non-ai.hermes ``XPC_SERVICE_NAME`` (app-coalition name inherited from the desktop session) is
+    NOT supervision: no KeepAlive job owns this process.
+    """
+    env = os.environ if environ is None else environ
+    pid = os.getpid() if pid is None else pid
+    if env.get("INVOCATION_ID"):
+        return True, "systemd INVOCATION_ID is minted for the unit invocation that exec'd this process"
+    if env.get("HERMES_S6_SUPERVISED_CHILD"):
+        return True, "s6 sentinel: the container supervisor restarts this process"
+    if str(env.get(EXTERNAL_GATEWAY_SUPERVISOR_ENV, "")).strip().lower() in _TRUTHY:
+        return True, "explicit --external-supervisor opt-in env: the operator promised the respawn"
+    label = launchd_job_label(env)
+    xpc = str(env.get("XPC_SERVICE_NAME", "") or "").strip()
+    if label is None:
+        if sys.platform == "darwin" and xpc and xpc != "0":
+            return False, (
+                f"XPC_SERVICE_NAME={xpc!r} is not an ai.hermes launchd job label — an app-coalition "
+                "marker inherited from the desktop session; no KeepAlive job owns this process"
+            )
+        return False, "no service-manager marker in this process's environment"
+    job_pid = (job_pid_fn or launchd_running_job_pid)(label)
+    if job_pid is None:
+        return False, (
+            f"launchd job {label!r} runs no process — it never spawned this gateway "
+            "(registered, on-demand-only domain, or unload/failed to start), so it will not "
+            f"relaunch an exit {GATEWAY_SERVICE_RESTART_EXIT_CODE}"
+        )
+    if job_pid == pid:
+        return True, f"launchd job {label!r} runs this process (pid {pid})"
+    ancestors = (ancestors_fn or process_ancestor_pids)(pid)
+    if job_pid in ancestors:
+        return True, f"this process (pid {pid}) descends from launchd job {label!r} (job pid {job_pid})"
+    return False, (
+        f"launchd job {label!r} runs pid {job_pid}, but this process is pid {pid} with ancestors "
+        f"{ancestors} — launchd did not spawn it, so it owes it no relaunch"
+    )
+
+
 def _seconds(value: object, fallback: float = 0.0) -> float:
     """Non-negative float, or ``fallback`` on non-numeric input."""
     try:
