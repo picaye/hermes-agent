@@ -30,13 +30,6 @@ from scripts.releases.authors import resolve_author
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-# GitHub rejects a release body over 125,000 characters (HTTP 422). The
-# automated canary caps its notes BELOW that hard limit, not at it: the
-# desktop-bundled-release workflow later swaps the HERMES_BUILDS_TABLE
-# marker for a run link and then for the download tables, growing the
-# body after creation. Keep headroom for that edit.
-RELEASE_BODY_BUDGET = 100_000
-
 
 def git(*args, cwd=None):
     """Run a git command and return stdout."""
@@ -312,17 +305,8 @@ def get_pr_number(subject: str) -> str | None:
 
 
 def generate_changelog(commits, tag_name, semver, repo_url="https://github.com/NousResearch/hermes-agent",
-                       prev_tag=None, first_release=False, no_changelog=False,
-                       max_body_chars: int | None = None):
-    """Generate markdown changelog from categorized commits.
-
-    GitHub refuses a release body over 125,000 characters. The stable path
-    leaves that case to its caller, which refuses the cut and asks for a
-    hand-written changelog; an automated caller passes ``max_body_chars``
-    and gets bullets shrunk per category until the body fits. The Full
-    Changelog link always names the complete comparison, so the
-    truncation is navigational, not lossy.
-    """
+                       prev_tag=None, first_release=False, no_changelog=False):
+    """Generate markdown changelog from categorized commits."""
     lines = []
 
     # Header
@@ -350,9 +334,10 @@ def generate_changelog(commits, tag_name, semver, repo_url="https://github.com/N
 
     all_authors = set()
     teknium_aliases = {"@teknium1"}
-    # Group commits by category
-    categories = defaultdict(list)
     if not no_changelog:
+        # Group commits by category
+        categories = defaultdict(list)
+
         for commit in commits:
             categories[commit["category"]].append(commit)
             author = commit["github_author"]
@@ -362,30 +347,27 @@ def generate_changelog(commits, tag_name, semver, repo_url="https://github.com/N
                 if coauthor not in teknium_aliases:
                     all_authors.add(coauthor)
 
-    # Category display order and emoji
-    category_order = [
-        ("breaking", "⚠️ Breaking Changes"),
-        ("features", "✨ Features"),
-        ("improvements", "🔧 Improvements"),
-        ("fixes", "🐛 Bug Fixes"),
-        ("docs", "📚 Documentation"),
-        ("tests", "🧪 Tests"),
-        ("chore", "🏗️ Infrastructure"),
-        ("other", "📦 Other Changes"),
-    ]
+        # Category display order and emoji
+        category_order = [
+            ("breaking", "⚠️ Breaking Changes"),
+            ("features", "✨ Features"),
+            ("improvements", "🔧 Improvements"),
+            ("fixes", "🐛 Bug Fixes"),
+            ("docs", "📚 Documentation"),
+            ("tests", "🧪 Tests"),
+            ("chore", "🏗️ Infrastructure"),
+            ("other", "📦 Other Changes"),
+        ]
 
-    def category_lines(per_category: int | None) -> list[str]:
-        """The category sections, listing at most ``per_category`` bullets each."""
-        out = []
         for cat_key, cat_title in category_order:
             cat_commits = categories.get(cat_key, [])
             if not cat_commits:
                 continue
 
-            out.append(f"## {cat_title}")
-            out.append("")
+            lines.append(f"## {cat_title}")
+            lines.append("")
 
-            for commit in cat_commits if per_category is None else cat_commits[:per_category]:
+            for commit in cat_commits:
                 subject = clean_subject(commit["subject"])
                 pr_num = get_pr_number(commit["subject"])
                 author = commit["github_author"]
@@ -400,60 +382,57 @@ def generate_changelog(commits, tag_name, semver, repo_url="https://github.com/N
                 if author not in teknium_aliases:
                     parts.append(f"— {author}")
 
-                out.append(" ".join(parts))
+                lines.append(" ".join(parts))
 
-            listed = len(cat_commits) if per_category is None else min(per_category, len(cat_commits))
-            hidden = len(cat_commits) - listed
-            if hidden:
-                out.append(f"- …and {hidden} more — see the full changelog link below")
+            lines.append("")
 
-            out.append("")
-        return out
+    # Contributors section
+    if all_authors:
+        # Sort contributors by commit count
+        author_counts = defaultdict(int)
+        for commit in commits:
+            author = commit["github_author"]
+            if author not in teknium_aliases:
+                author_counts[author] += 1
+            for coauthor in commit.get("coauthors", []):
+                if coauthor not in teknium_aliases:
+                    author_counts[coauthor] += 1
 
-    def tail_lines() -> list[str]:
-        out = []
-        # Contributors section
-        if all_authors:
-            # Sort contributors by commit count
-            author_counts = defaultdict(int)
-            for commit in commits:
-                author = commit["github_author"]
-                if author not in teknium_aliases:
-                    author_counts[author] += 1
-                for coauthor in commit.get("coauthors", []):
-                    if coauthor not in teknium_aliases:
-                        author_counts[coauthor] += 1
+        sorted_authors = sorted(author_counts.items(), key=lambda x: -x[1])
 
-            sorted_authors = sorted(author_counts.items(), key=lambda x: -x[1])
+        lines.append("## 👥 Contributors")
+        lines.append("")
+        lines.append("Thank you to everyone who contributed to this release!")
+        lines.append("")
+        for author, count in sorted_authors:
+            commit_word = "commit" if count == 1 else "commits"
+            lines.append(f"- {author} ({count} {commit_word})")
+        lines.append("")
 
-            out.append("## 👥 Contributors")
-            out.append("")
-            out.append("Thank you to everyone who contributed to this release!")
-            out.append("")
-            for author, count in sorted_authors:
-                commit_word = "commit" if count == 1 else "commits"
-                out.append(f"- {author} ({count} {commit_word})")
-            out.append("")
+    # Full changelog link
+    if prev_tag:
+        lines.append(f"**Full Changelog**: [{prev_tag}...{tag_name}]({repo_url}/compare/{prev_tag}...{tag_name})")
+    else:
+        lines.append(f"**Full Changelog**: [{tag_name}]({repo_url}/commits/{tag_name})")
+    lines.append("")
 
-        # Full changelog link
-        if prev_tag:
-            out.append(f"**Full Changelog**: [{prev_tag}...{tag_name}]({repo_url}/compare/{prev_tag}...{tag_name})")
-        else:
-            out.append(f"**Full Changelog**: [{tag_name}]({repo_url}/commits/{tag_name})")
-        out.append("")
-        return out
+    return "\n".join(lines)
 
-    def assemble(per_category: int | None) -> str:
-        sections = lines + ([] if no_changelog else category_lines(per_category)) + tail_lines()
-        return "\n".join(sections)
 
-    body = assemble(None)
-    per_category = None
-    while max_body_chars is not None and len(body) > max_body_chars and per_category != 0:
-        # Halve the listed bullets per category until the automated body fits.
-        per_category = max(1, len(commits)) if per_category is None else per_category // 2
-        body = assemble(per_category)
-    return body
+# The builds-table job later splices its downloads into the draft, under the same GitHub limit.
+BUILDS_TABLE_ROOM = 10_000
+
+
+def _canary_notes(commits, tag: str, version: str, *, since: str | None, no_changelog: bool) -> str:
+    """The draft body: the changelog, or only its link when the list would not fit GitHub's limit."""
+    from scripts.releases.entrypoint import GITHUB_BODY_LIMIT
+
+    notes = generate_changelog(commits, tag, version, prev_tag=since, no_changelog=no_changelog)
+    if len(notes) <= GITHUB_BODY_LIMIT - BUILDS_TABLE_ROOM:
+        return notes
+    print(f"⚠ The changelog is {len(notes):,} characters, over GitHub's {GITHUB_BODY_LIMIT:,} once the builds "
+          "table is added. The draft links the full changelog instead of listing it.")
+    return generate_changelog(commits, tag, version, prev_tag=since, no_changelog=True)
 
 
 def _resume_canary(tag: str, remote: str, repository: str, *, notes_file: Path | None = None) -> None:
@@ -482,25 +461,15 @@ def _resume_canary(tag: str, remote: str, repository: str, *, notes_file: Path |
             "--verify-tag", "--draft", "--prerelease",
             "--title", f"Hermes Agent canary {tag}",
         ]
-        create.extend(["--notes-file", str(notes_file)] if notes_file else ["--generate-notes"])
+        # GitHub's generated notes cover every pull request since the last published release, unbounded.
+        notes = None if notes_file else generate_changelog(
+            [], tag, tag[1:], repo_url=f"https://github.com/{repository}", no_changelog=True
+        )
+        create.extend(["--notes-file", str(notes_file) if notes_file else "-"])
         created = subprocess.run(
-            create, cwd=REPO_ROOT, capture_output=True, text=True, encoding="utf-8",
+            create, input=notes, cwd=REPO_ROOT, capture_output=True, text=True, encoding="utf-8",
             check=False,
         )
-        if (created.returncode != 0 and notes_file is None
-                and "body is too long" in (created.stderr or "").lower()):
-            # GitHub's own generated notes can also blow the 125k body cap
-            # on a wide window. Fall back to a minimal body so the receipt
-            # still converges; the commits link carries the rest.
-            create = [a for a in create if a != "--generate-notes"] + [
-                "--notes",
-                f"Hermes Agent canary {tag}.\n\n"
-                f"Full changelog: https://github.com/{repository}/commits/{tag}\n",
-            ]
-            created = subprocess.run(
-                create, cwd=REPO_ROOT, capture_output=True, text=True, encoding="utf-8",
-                check=False,
-            )
         if created.returncode != 0:
             raise ValueError(created.stderr.strip() or "Canary draft could not be recovered")
         draft_url = created.stdout.strip()
@@ -581,10 +550,7 @@ def cmd_canary(args) -> None:
 
     version = tag_name.lstrip("v")
     print(f"Canary: {tag_name} ({len(commits)} commits since {since})")
-    changelog = generate_changelog(
-        commits, tag_name, version, prev_tag=since, first_release=False,
-        no_changelog=args.no_changelog, max_body_chars=RELEASE_BODY_BUDGET,
-    )
+    changelog = _canary_notes(commits, tag_name, version, since=since, no_changelog=args.no_changelog)
 
     if not args.publish:
         print(changelog)
@@ -658,25 +624,8 @@ def prune_old_canaries(args) -> None:
         )
         if result.returncode == 0:
             print(f"✓ Deleted {tag}")
-            continue
-        # A canary whose draft creation failed (e.g. the 2026-10-12 HTTP 422
-        # body-too-long runs) pushed the receipt tag and stopped: an orphan
-        # tag with no release. gh release delete cannot remove what does not
-        # exist — check for that and drop the tag itself, remote first.
-        view = subprocess.run(
-            ["gh", "release", "view", tag] + (["--repo", gh_repo] if gh_repo else []),
-            capture_output=True, text=True, encoding="utf-8", errors="replace",
-            cwd=str(REPO_ROOT), check=False,
-        )
-        if view.returncode == 0:
+        else:
             print(f"⚠ Could not delete {tag}: {result.stderr.strip()}")
-            continue
-        pushed = git_result("push", push_remote, f":refs/tags/{tag}")
-        if pushed.returncode != 0:
-            print(f"⚠ Could not delete orphan tag {tag}: {pushed.stderr.strip()}")
-            continue
-        git("tag", "-d", tag)
-        print(f"✓ Deleted orphan tag {tag} (no release)")
     if not args.publish:
         print("Dry run complete. No release was deleted.")
         print("Run the same command with --publish to delete the tags above.")
