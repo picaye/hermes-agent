@@ -283,6 +283,63 @@ def test_store_attachment_bytes_roundtrip(kanban_home):
         conn.close()
 
 
+def test_store_attachment_joins_task_board_not_ambient_env(kanban_home, monkeypatch):
+    # t_1877d0d3 regression: the incident shape is a worker whose DB pin points
+    # at the default board's kanban.db while the AMBIENT board
+    # (HERMES_KANBAN_BOARD / kanban/current) says another board — the pre-fix
+    # write site resolved the blob root from the env alone, splitting every
+    # attach across roots (rows in default kanban.db, blobs under
+    # boards/steuer/attachments/). The task's own DB must win over the env.
+    monkeypatch.delenv("HERMES_KANBAN_ATTACHMENTS_ROOT", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    kb.write_board_metadata("steuer", name="Steuer")
+    # Pin the connection to the default-board DB, exactly as the dispatcher
+    # pins HERMES_KANBAN_DB for a default-board worker.
+    default_db = kb.kanban_db_path(board="default")
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(default_db))
+    assert default_db.parent == kb.kanban_home()  # sanity: root-level DB
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "steuer")
+    conn = kbc.connect()  # default-board DB via the pin
+    try:
+        assert kb.conn_board_slug(conn) == "default"
+        task_id = _make_task(conn, title="default-board probe")
+        att_id = kb.store_attachment_bytes(
+            conn, task_id, "probe.txt", b"ambient-mismatch", uploaded_by="tester",
+        )
+        a = kb.get_attachment(conn, att_id)
+        assert a is not None
+        stored = Path(a.stored_path)
+        default_root = kb.attachments_root(board="default").resolve()
+        assert stored.resolve().is_relative_to(default_root / task_id)
+        assert "steuer" not in str(stored)
+        assert (default_root / task_id / "probe.txt").read_bytes() == b"ambient-mismatch"
+        # the wrong root must contain nothing for this task
+        assert not (kb.attachments_root(board="steuer") / task_id).exists()
+    finally:
+        conn.close()
+
+
+def test_store_attachment_rejects_contradicting_board(kanban_home, monkeypatch):
+    # AC2 mismatch case: an explicit board= that disagrees with the task's own
+    # DB is a loud refusal, never a split write.
+    monkeypatch.delenv("HERMES_KANBAN_ATTACHMENTS_ROOT", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    kb.write_board_metadata("steuer", name="Steuer")
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(kb.kanban_db_path(board="default")))
+    conn = kbc.connect()  # default-board DB
+    try:
+        assert kb.conn_board_slug(conn) == "default"
+        task_id = _make_task(conn, title="contradiction probe")
+        with pytest.raises(ValueError, match="refusing to split attachments"):
+            kb.store_attachment_bytes(
+                conn, task_id, "bad.txt", b"x", board="steuer", uploaded_by="tester",
+            )
+        assert not (kb.attachments_root(board="steuer") / task_id).exists()
+        assert kb.list_attachments(conn, task_id) == []
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------------------
 # CLI — hermes kanban attach / attachments / attach-rm
 # ---------------------------------------------------------------------------

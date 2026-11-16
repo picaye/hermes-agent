@@ -583,6 +583,30 @@ def task_attachments_dir(task_id: str, board: Optional[str] = None) -> Path:
     return attachments_root(board=board) / task_id
 
 
+def conn_board_slug(conn: sqlite3.Connection) -> Optional[str]:
+    """The board slug of the database ``conn`` has open — the task's ACTUAL
+    board, derived from the file path rather than the ambient environment.
+    ``<root>/kanban/boards/<slug>/kanban.db`` -> ``<slug>``; a root-level
+    ``<root>/kanban.db`` -> ``default``; anything else (in-memory DB, a
+    ``HERMES_KANBAN_DB`` pin to a non-standard location) -> ``None``.
+    """
+    try:
+        row = conn.execute("PRAGMA database_list").fetchone()
+    except sqlite3.Error:
+        return None
+    path = (row[2] or "") if row and len(row) > 2 else ""
+    if not path:
+        return None
+    p = Path(path.split("?")[0])  # tolerate file:-URI mode suffixes
+    if p.name != "kanban.db":
+        return None
+    if p.parent == kanban_home():
+        return DEFAULT_BOARD
+    if p.parent.parent == boards_root():
+        return _normalize_board_slug(p.parent.name)
+    return None
+
+
 def worker_logs_dir(board: Optional[str] = None) -> Path:
     """Per-board worker log dir (logs follow the board so ``hermes kanban log``
     is unambiguous when two boards share a task id)."""
@@ -1780,6 +1804,28 @@ def store_attachment_bytes(
     if len(data) > max_bytes:
         raise AttachmentTooLarge(f"attachment exceeds {max_bytes // (1024 * 1024)} MB limit")
     safe_name = _safe_attachment_name(filename)
+    # Board-root join (t_1877d0d3). With ``board=None`` the root below resolves
+    # from the AMBIENT environment (HERMES_KANBAN_ATTACHMENTS_ROOT →
+    # HERMES_KANBAN_BOARD → kanban/current pointer), which drifts independently
+    # of the board ``conn`` is opened against: a host board-switch rewrites the
+    # shared pointer file, or a dispatcher pins the task DB for one board while
+    # the container env names another. That silently split one task's
+    # attachments across roots — metadata rows in one board's kanban.db, blobs
+    # under ``boards/<other>/attachments/`` (observed: default-board t_1fb02fc4
+    # #119–#121 landed under boards/steuer/). The task's own DB is the source
+    # of truth and outranks the ambient fallback; an explicit ``board=`` that
+    # contradicts it is refused loudly instead of splitting the write.
+    task_board = conn_board_slug(conn)
+    if task_board is not None:
+        wanted = _normalize_board_slug(board) if board is not None else None
+        if wanted is not None and wanted != task_board:
+            raise ValueError(
+                f"attachment board={board!r} contradicts task {task_id!r}'s board "
+                f"'{task_board}' (connection DB {kanban_db_path(board=task_board)}); "
+                "refusing to split attachments across board roots"
+            )
+        if wanted is None:
+            board = task_board
     dest_dir = task_attachments_dir(task_id, board=board)
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest_path = _collision_free_path(dest_dir, safe_name)

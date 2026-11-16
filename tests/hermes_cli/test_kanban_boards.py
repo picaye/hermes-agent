@@ -323,6 +323,10 @@ class TestWorkerSpawnEnv:
         assert env["HERMES_KANBAN_DB"] == str(expected_db)
         expected_ws = fresh_home / "kanban" / "boards" / "spawntest" / "workspaces"
         assert env["HERMES_KANBAN_WORKSPACES_ROOT"] == str(expected_ws)
+        # t_1877d0d3: the attachments root is pinned to the same board so a
+        # worker can never resolve blobs against another board's env/pointer.
+        expected_att = fresh_home / "kanban" / "boards" / "spawntest" / "attachments"
+        assert env["HERMES_KANBAN_ATTACHMENTS_ROOT"] == str(expected_att)
 
 
 # ---------------------------------------------------------------------------

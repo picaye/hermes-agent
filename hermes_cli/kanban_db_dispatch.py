@@ -2825,6 +2825,11 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     # match after `hermes -p` rewrites HERMES_HOME (symlink / Docker layouts).
     env["HERMES_KANBAN_DB"] = str(_kb.kanban_db_path(board=board))
     env["HERMES_KANBAN_WORKSPACES_ROOT"] = str(_kb.workspaces_root(board=board))
+    # Attachments root must be pinned too (t_1877d0d3): unpinned, a worker's
+    # store_attachment_bytes resolves the blob root from HERMES_KANBAN_BOARD /
+    # the shared kanban/current pointer — which drift independently of the DB
+    # pin and silently split a task's attachments across board roots.
+    env["HERMES_KANBAN_ATTACHMENTS_ROOT"] = str(_kb.attachments_root(board=board))
     # Board slug — defense-in-depth pin if a path is resolved without the
     # DB / workspaces env vars.
     env["HERMES_KANBAN_BOARD"] = _kb._normalize_board_slug(board) or _kb.get_current_board()
