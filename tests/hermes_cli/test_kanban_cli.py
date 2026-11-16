@@ -293,3 +293,31 @@ def test_run_slash_reclaim_running_task(kanban_home):
 # ---------------------------------------------------------------------------
 
 
+
+def test_cli_archive_rm_leaves_durable_deletion_audit(kanban_home):
+    """``hermes kanban archive --rm <id>`` is the zero-trace purge path
+    (t_327e01b8). After the fix the task is still gone but exactly one
+    queryable audit record survives, naming the CLI as its source."""
+    tid = None
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="doomed card", assignee="worker")
+
+    out = kc.run_slash(f"archive {tid}")
+    assert "Archived" in out, out
+    out = kc.run_slash(f"archive --rm {tid}")
+    assert "Deleted" in out, out
+
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, tid) is None  # two-step purge unchanged
+        rec = kb.get_deletion(conn, tid)
+        assert rec is not None
+        assert rec["task_id"] == tid
+        assert rec["title"] == "doomed card"
+        assert rec["status"] == "archived"
+        assert rec["source"] == "cli:archive --rm"
+        assert rec["deleted_by"]  # profile-author plumbing reached the row
+
+        # Non-archived tasks still refuse the purge (AC3 unchanged).
+        live = kb.create_task(conn, title="still alive")
+        assert kb.delete_archived_task(conn, live) is False
+        assert kb.get_deletion(conn, live) is None

@@ -1040,6 +1040,13 @@ def _run_post_update_maintenance(
         from hermes_cli.git_commit_graph import spawn_commit_graph_refresh
         spawn_commit_graph_refresh(Path(_m().PROJECT_ROOT))
 
+    # Post-deploy invariant guard (fork): a detached upstream-tag checkout silently drops
+    # fork fixes (twice in Oct-2026). Flag it and prove designated fixes are ancestors of
+    # HEAD before the completion line prints success. Best-effort: never fails the update.
+    with _best_effort('Post-deploy guard check failed: %s'):
+        from hermes_cli.deploy_guard import guard_after_checkout
+        guard_after_checkout(Path(_m().PROJECT_ROOT))
+
     # Seed the model-catalog cache from the checkout instead of a bot-gated, flaky fetch.
     with _best_effort('Model catalog seed during update failed: %s'):
         from hermes_cli.model_catalog import seed_cache_from_checkout

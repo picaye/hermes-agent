@@ -151,6 +151,64 @@ def test_a_newer_published_release_outranks_the_protected_head():
     ) == ("0.21.7", "a" * 40)
 
 
+def _record(repository: str) -> dict:
+    return {
+        "schema": 1, "name": "stable", "repository": repository,
+        "policy": "stable-release", "state": "active", "revision": 1,
+        "nextSequence": 2, "head": None,
+        "identity": {
+            "token": "f" * 16, "displayName": "Hermes Agent",
+            "appNamePascal": "HermesBundled", "artifactNamePascal": "HermesBundled",
+            "appId": "com.nousresearch.hermes-bundled",
+            "msixAppIdWithOrg": "NousResearch.HermesBundled",
+            "cliName": "hermes", "windowsExecutableName": "Hermes Agent",
+        },
+    }
+
+
+def test_a_foreign_channel_record_raises_the_authority_subclass():
+    """The strict reader path still fails closed, but as a named subclass."""
+    from hermes_cli.release_channels import (
+        ChannelAuthorityMismatch, ChannelError, validate_record,
+    )
+
+    with pytest.raises(ChannelAuthorityMismatch) as raised:
+        validate_record(_record("NousResearch/hermes-agent"), name="stable",
+                        repository="picaye/hermes-agent")
+    assert isinstance(raised.value, ChannelError)
+
+
+def test_a_foreign_record_never_seeds_this_repositorys_line():
+    """A fork reading the shared public store falls back to its own releases."""
+    from scripts.releases.versioning import published_stable_identity
+
+    class ForeignStoreReader:
+        def __init__(self, base, repository):
+            assert base == "https://assets.example"
+            assert repository == "picaye/hermes-agent"
+
+        def resolve(self, name):
+            from hermes_cli.release_channels import ChannelAuthorityMismatch
+            raise ChannelAuthorityMismatch("Channel repository authority mismatch")
+
+    # No published GitHub releases either: the line starts from the seed.
+    assert published_stable_identity(
+        "picaye/hermes-agent", base_url="https://assets.example",
+        reader_type=ForeignStoreReader, run=lambda argv: "[[]]",
+    ) == (SEED, None)
+
+    def run(argv):
+        if argv[:4] == ["gh", "api", "--paginate", "--slurp"]:
+            return json.dumps([[{"tag_name": "v0.21.6", "draft": False, "prerelease": False}]])
+        return "d" * 40
+
+    # With a published release of its own, that identity wins over the seed.
+    assert published_stable_identity(
+        "picaye/hermes-agent", base_url="https://assets.example",
+        reader_type=ForeignStoreReader, run=run,
+    ) == ("0.21.6", "d" * 40)
+
+
 def test_outstanding_attempts_is_the_one_shared_predicate():
     from scripts.releases.versioning import outstanding_attempts
 

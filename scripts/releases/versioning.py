@@ -23,7 +23,7 @@ BUMPS = ("major", "minor", "patch")
 def published_channel_identity(repository: str, channel: str, *, base_url: str | None = None,
                                reader_type=None) -> tuple[str, str] | None:
     """Resolve one validated protected channel's payload version and commit."""
-    from hermes_cli.release_channels import ChannelNotFound, ChannelReader
+    from hermes_cli.release_channels import ChannelAuthorityMismatch, ChannelNotFound, ChannelReader
     from scripts.releases.r2 import public_base_url
 
     if channel not in {"stable", "canary"}:
@@ -31,7 +31,11 @@ def published_channel_identity(repository: str, channel: str, *, base_url: str |
     reader_type = reader_type or ChannelReader
     try:
         resolved = reader_type(base_url or public_base_url(), repository=repository).resolve(channel)
-    except ChannelNotFound:
+    except (ChannelNotFound, ChannelAuthorityMismatch):
+        # A store that carries another repository's record (a fork reading the
+        # default public bucket sees upstream's channel) holds no publication
+        # for this repository. The caller's GitHub-releases fallback is then
+        # the authority; the record itself must never seed a fork's version.
         return None
     if resolved.manifest is None:
         return None

@@ -971,6 +971,28 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
+-- Durable audit trail for hard deletes (t_327e01b8). ``archive --rm`` and
+-- the dashboard DELETE route purge a task row AND every related row —
+-- including its task_events — via _delete_task_relations(), so a purged
+-- card was 100% invisible to board-history queries and sweep
+-- dedupe/exemption baselines. One row is appended per successful delete,
+-- INSIDE the delete transaction and BEFORE the purge, capturing a final
+-- snapshot of the card. Rows are keyed by the deleted task id and are
+-- DELIBERATELY not purged by _delete_task_relations() — they must
+-- outlive the task they describe.
+CREATE TABLE IF NOT EXISTS task_deletions (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id      TEXT NOT NULL,
+    title        TEXT,
+    status       TEXT,
+    assignee     TEXT,
+    tenant       TEXT,
+    deleted_at   INTEGER NOT NULL,
+    deleted_by   TEXT,
+    source       TEXT,
+    snapshot     TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
 CREATE INDEX IF NOT EXISTS idx_links_parent          ON task_links(parent_id);
@@ -980,6 +1002,7 @@ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, start
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+CREATE INDEX IF NOT EXISTS idx_deletions_task        ON task_deletions(task_id, deleted_at);
 """
 
 
@@ -3224,15 +3247,21 @@ def _route_block(
     incomplete parent are re-kinded to ``needs_input`` before this runs
     (see :func:`block_task`). Every other kind counts unblock-loop
     recurrences: block_task only fires from running/ready (AFTER an unblock
-    returned the task to the pool), so a stored ``block_kind`` equal to the
-    incoming one means blocked -> unblocked -> re-block for the same cause
-    (un-typed None compares equal to a prior un-typed block). At
-    ``BLOCK_RECURRENCE_LIMIT`` the task routes to ``triage`` for a human.
+    returned the task to the pool), so any growing count means
+    blocked -> unblocked -> re-block without a human re-scope. The count is
+    deliberately kind-INDEPENDENT: a worker or cron that re-labels its block
+    kind each attempt (needs_input -> capability -> ...) must not launder the
+    breaker's memory (live 2026-11-12 canary: kind change reset 2 -> 1,
+    bypassing both this triage entry and the auto-decomposer's exit guard,
+    which keys on ``block_recurrences``). The only mid-life reset is the
+    human re-arm in :func:`specify_triage_task`; ``complete_task`` clears it
+    as terminal progress. At ``BLOCK_RECURRENCE_LIMIT`` the task routes to
+    ``triage`` for a human.
     """
     payload = {"reason": reason, "kind": kind, "source_status": source_status}
     if kind == "dependency":
         return "todo", "dependency_wait", "block_kind    = ?", (kind,), payload
-    recurrences = prev_recurrences + 1 if prev_kind == kind else 1
+    recurrences = prev_recurrences + 1
     set_sql = "block_kind    = ?,\n                       block_recurrences = ?"
     payload = {"reason": reason, "kind": kind, "recurrences": recurrences, "source_status": source_status}
     if recurrences >= BLOCK_RECURRENCE_LIMIT:
@@ -3736,6 +3765,13 @@ def specify_triage_task(
     """Update title/body/assignee (when given) and move ``triage -> todo`` in one
     txn; False when not in triage. Lands in ``todo`` (not ``ready``) so parent
     gating still applies; the audit comment is written only when a field changed.
+
+    A specify that leaves a card with unblock-loop memory
+    (``block_recurrences > 0``) clears ``block_kind``/``block_recurrences``:
+    this transition is the human re-arm path — the auto-decomposer excludes
+    loop-limited cards (``kanban_decompose.list_triage_ids``) — so a reset
+    here means a person deliberately re-scoped the card and it earns a fresh
+    ``BLOCK_RECURRENCE_LIMIT`` budget rather than an instant re-escalation.
     """
     if title is not None and not title.strip():
         raise ValueError("title cannot be blank")
@@ -3769,6 +3805,11 @@ def specify_triage_task(
         )
         if cur.rowcount != 1:
             return False
+        loop_reset = conn.execute(
+            "UPDATE tasks SET block_kind = NULL, block_recurrences = 0 "
+            "WHERE id = ? AND block_recurrences > 0",
+            (task_id,),
+        ).rowcount
         if changed_fields and author and author.strip():
             # Not add_comment (own txn + 'commented' event); 'specified' below records it.
             _insert_comment(
@@ -3776,9 +3817,14 @@ def specify_triage_task(
                 "Specified — updated " + ", ".join(changed_fields) + " and promoted to todo.",
                 int(time.time()),
             )
+        specified_payload: dict[str, Any] = {}
+        if changed_fields:
+            specified_payload["changed_fields"] = changed_fields
+        if loop_reset:
+            specified_payload["loop_counter_reset"] = True
         _append_event(
             conn, task_id, "specified",
-            {"changed_fields": changed_fields} if changed_fields else None,
+            specified_payload or None,
         )
     # Own IMMEDIATE txn (outside the one above): a parent-free specified task
     # flips to 'ready' now instead of idling until the next tick.
@@ -3834,29 +3880,121 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
 
 
 def _delete_task_relations(conn: sqlite3.Connection, task_id: str) -> None:
-    """Delete every row referencing ``task_id`` (schema has no ON DELETE CASCADE)."""
+    """Delete every row referencing ``task_id`` (schema has no ON DELETE CASCADE).
+
+    ``task_deletions`` is deliberately NOT listed here: its rows must
+    outlive the task they describe (audit trail for the purge, t_327e01b8).
+    """
     conn.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (task_id, task_id))
     for table in ("task_comments", "task_events", "task_runs", "kanban_notify_subs"):
         conn.execute(f"DELETE FROM {table} WHERE task_id = ?", (task_id,))
 
 
-def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
+def _append_deletion_audit(
+    conn: sqlite3.Connection,
+    task_row: sqlite3.Row,
+    *,
+    actor: Optional[str] = None,
+    source: Optional[str] = None,
+) -> None:
+    """Append the durable audit record for one hard delete, inside the
+    caller's delete transaction and BEFORE :func:`_delete_task_relations`
+    purges the task's events/comments/runs.
+
+    ``task_row`` is the full ``tasks`` row captured while the task still
+    exists. The card stays queryable afterwards via
+    :func:`list_deletions` — board history and sweep dedupe/exemption
+    baselines no longer go blind on purge (t_327e01b8).
+    """
+    task_id = task_row["id"]
+    conn.execute(
+        "INSERT INTO task_deletions "
+        "(task_id, title, status, assignee, tenant, deleted_at, deleted_by, source, snapshot) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            task_id,
+            task_row["title"],
+            task_row["status"],
+            task_row["assignee"],
+            task_row["tenant"],
+            int(time.time()),
+            actor,
+            source,
+            _json_or_null({k: task_row[k] for k in task_row.keys()}),
+        ),
+    )
+
+
+def get_deletion(conn: sqlite3.Connection, task_id: str) -> Optional[dict]:
+    """Most recent deletion audit row for ``task_id``, or ``None`` if the
+    task was never purged. Survives ``_delete_task_relations`` by design."""
+    row = conn.execute(
+        "SELECT * FROM task_deletions WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def list_deletions(
+    conn: sqlite3.Connection,
+    *,
+    since: Optional[int] = None,
+    limit: Optional[int] = None,
+) -> list[dict]:
+    """Deletion audit rows (oldest first), optionally filtered to
+    ``deleted_at >= since`` — the queryable board-history surface for
+    purged cards."""
+    q = "SELECT * FROM task_deletions"
+    args: list = []
+    if since is not None:
+        q += " WHERE deleted_at >= ?"
+        args.append(since)
+    q += " ORDER BY id ASC"
+    if limit is not None:
+        q += " LIMIT ?"
+        args.append(int(limit))
+    return [dict(r) for r in conn.execute(q, args).fetchall()]
+
+
+def delete_archived_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    actor: Optional[str] = None,
+    source: Optional[str] = None,
+) -> bool:
     """Hard-delete an ARCHIVED task (+ related rows); anything else must be
-    archived first so data loss takes two deliberate actions."""
+    archived first so data loss takes two deliberate actions. A durable
+    ``task_deletions`` audit row is appended before the purge."""
     with write_txn(conn):
-        if _task_status(conn, task_id) != "archived":
+        row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if row is None or row["status"] != "archived":
             return False
+        _append_deletion_audit(conn, row, actor=actor, source=source)
         _delete_task_relations(conn, task_id)
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         return cur.rowcount == 1
 
 
-def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Hard-delete a task and its related rows in one txn; False when not found."""
+def delete_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    actor: Optional[str] = None,
+    source: Optional[str] = None,
+) -> bool:
+    """Hard-delete a task and its related rows in one txn; False when not found.
+    A durable ``task_deletions`` audit row is appended before the purge."""
     with write_txn(conn):
-        cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
-        if cur.rowcount != 1:
+        row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if row is None:
             return False
+        # BEGIN IMMEDIATE serializes writers, so between the SELECT above and
+        # this DELETE no concurrent commit can remove the row: rowcount == 1.
+        conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+        # Audit BEFORE the relations purge: the record must outlive the rows
+        # _delete_task_relations() removes (t_327e01b8).
+        _append_deletion_audit(conn, row, actor=actor, source=source)
         _delete_task_relations(conn, task_id)
     recompute_ready(conn)
     return True

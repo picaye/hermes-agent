@@ -326,14 +326,32 @@ async def _start_gateway_start_control_socket(runner):
                 _drain = 0.0 if force else float(_get_restart_drain_timeout())
             except Exception:
                 _drain = 30.0
+            # Trust vs ownership (t_4d8f6e29): the updater chose the pause verb because it believes a
+            # supervisor (or its own watcher) will relaunch after the exit. Exit-75 alone strands a
+            # process launchd never spawned — verify this process is actually service-owned before
+            # taking that route, and arm the detached self-relaunch helper when it is not.
+            from gateway.restart import service_restart_route_trusted
+            trusted, route_reason = service_restart_route_trusted()
+            if not trusted:
+                logger.warning(
+                    "pause-for-update: no restarting supervisor owns this gateway (%s) — arming the "
+                    "detached self-relaunch helper so the post-update code comes back up regardless "
+                    "of what the updater's hand-back assumed.", route_reason,
+                )
             accepted_box: list = []
             _done = threading.Event()
 
             def _request() -> None:
                 try:
-                    from gateway.restart_when_idle import force_restart, request_service_restart
-                    accepted_box.append(force_restart(runner) if force else request_service_restart(runner))
-                    accepted_box.append(runner._describe_active_work())
+                    from gateway.restart_when_idle import force_restart, request_restart, request_service_restart
+                    if trusted:
+                        accepted_box.append(force_restart(runner) if force else request_service_restart(runner))
+                        accepted_box.append(runner._describe_active_work())
+                    else:
+                        accepted_box.append(
+                            force_restart(runner, detached=True, via_service=False) if force
+                            else request_restart(runner, detached=True, via_service=False)
+                        )
                 finally:
                     _done.set()
 
@@ -343,7 +361,12 @@ async def _start_gateway_start_control_socket(runner):
             return {
                 "pausing": accepted, "already_stopping": not accepted,
                 "pid": os.getpid(), "drain_timeout": _drain, "force": force,
-                "waiting_on": accepted_box[1] if len(accepted_box) > 1 else []}
+                "waiting_on": accepted_box[1] if len(accepted_box) > 1 else [],
+                # Tell the updater the truth about this process's supervision (t_4d8f6e29): a caller
+                # that assumed the "external-supervisor" hand-back can switch to watching for the
+                # detached helper's fresh PID instead of waiting on launchctl.
+                "supervised": trusted, "restart_route": "service" if trusted else "detached",
+            }
 
         def _rescan_profiles_handler() -> dict:
             """``hermes profile create/delete`` asks the multiplexer to reconcile ``profiles/`` now

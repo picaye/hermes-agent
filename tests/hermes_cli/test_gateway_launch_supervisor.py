@@ -49,6 +49,8 @@ def test_identify_payload_carries_the_launch_supervisor(monkeypatch):
 def test_declares_external_supervisor(monkeypatch, tmp_path, identity, argv, external):
     monkeypatch.setattr(control_socket, "identify_gateway", lambda home, **k: identity)
     monkeypatch.setattr(gw, "_capture_gateway_argv", lambda pid: argv)
+    # Hermetic on darwin runners too (t_4d8f6e29 added a launchd pid-chain probe to the claim).
+    monkeypatch.setattr(gw, "_launchd_owns_gateway_pid", lambda pid: True)
     assert supervised.gateway_declares_external_supervisor(4321, home=tmp_path) is external
 
 
